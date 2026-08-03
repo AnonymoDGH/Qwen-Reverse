@@ -37,7 +37,7 @@ from .cookies import generate_cookies
 from .fingerprint import generate_fingerprint, parse_fingerprint
 from .bxua import BXUAGenerator, generate_bx_ua
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 _URL_RE = re.compile(r"https?://[^\s)\]]+")
 
@@ -59,31 +59,43 @@ class Generative:
 
     async def generate(self, prompt: str, **kwargs) -> str:
         parts = []
+        model = kwargs.pop("model", self.model)
+        token = kwargs.pop("token", self.token)
+        proxy = kwargs.pop("proxy", self.proxy)
+        timeout = kwargs.pop("timeout", self.timeout)
         chat_type = kwargs.pop("chat_type", self.chat_type)
         async for event in create_chat(
-            self.model, [{"role": "user", "content": prompt}],
-            token=self.token, chat_type=chat_type,
-            proxy=self.proxy, timeout=self.timeout, **kwargs,
+            model, [{"role": "user", "content": prompt}],
+            token=token, chat_type=chat_type,
+            proxy=proxy, timeout=timeout, **kwargs,
         ):
             if event["type"] == "content":
                 parts.append(event["data"])
         return "".join(parts)
 
     def stream(self, prompt: str, **kwargs) -> AsyncIterator[dict]:
+        model = kwargs.pop("model", self.model)
+        token = kwargs.pop("token", self.token)
+        proxy = kwargs.pop("proxy", self.proxy)
+        timeout = kwargs.pop("timeout", self.timeout)
         chat_type = kwargs.pop("chat_type", self.chat_type)
         return create_chat(
-            self.model, [{"role": "user", "content": prompt}],
-            token=self.token, chat_type=chat_type,
-            proxy=self.proxy, timeout=self.timeout, **kwargs,
+            model, [{"role": "user", "content": prompt}],
+            token=token, chat_type=chat_type,
+            proxy=proxy, timeout=timeout, **kwargs,
         )
 
     async def generate_image(self, prompt: str, aspect_ratio: str = "1:1", **kwargs) -> list[str]:
         urls = []
+        model = kwargs.pop("model", self.model)
+        token = kwargs.pop("token", self.token)
+        proxy = kwargs.pop("proxy", self.proxy)
+        timeout = kwargs.pop("timeout", self.timeout)
         aspect_ratio = kwargs.pop("aspect_ratio", aspect_ratio)
         async for event in create_chat(
-            self.model, [{"role": "user", "content": prompt}],
-            token=self.token, chat_type="t2i",
-            proxy=self.proxy, timeout=self.timeout,
+            model, [{"role": "user", "content": prompt}],
+            token=token, chat_type="t2i",
+            proxy=proxy, timeout=timeout,
             aspect_ratio=aspect_ratio, **kwargs,
         ):
             if event["type"] == "image":
@@ -94,11 +106,15 @@ class Generative:
 
     async def generate_video(self, prompt: str, aspect_ratio: str = "16:9", **kwargs) -> list[str]:
         urls = []
+        model = kwargs.pop("model", self.model)
+        token = kwargs.pop("token", self.token)
+        proxy = kwargs.pop("proxy", self.proxy)
+        timeout = kwargs.pop("timeout", self.timeout)
         aspect_ratio = kwargs.pop("aspect_ratio", aspect_ratio)
         async for event in create_chat(
-            self.model, [{"role": "user", "content": prompt}],
-            token=self.token, chat_type="t2v",
-            proxy=self.proxy, timeout=self.timeout,
+            model, [{"role": "user", "content": prompt}],
+            token=token, chat_type="t2v",
+            proxy=proxy, timeout=timeout,
             aspect_ratio=aspect_ratio, **kwargs,
         ):
             if event["type"] == "content":
@@ -167,9 +183,15 @@ class Conversation:
     async def _stream(self, prompt: str, **kwargs) -> AsyncIterator[dict]:
         self.messages.append({"role": "user", "content": prompt})
         answer: list[str] = []
+        model = kwargs.pop("model", self.model)
+        token = kwargs.pop("token", self.token)
+        chat_type = kwargs.pop("chat_type", self.chat_type)
+        proxy = kwargs.pop("proxy", self.proxy)
+        timeout = kwargs.pop("timeout", self.timeout)
+        tools = kwargs.pop("tools", self.tools)
         async for event in create_chat(
-            self.model, self.messages, token=self.token, chat_type=self.chat_type,
-            proxy=self.proxy, timeout=self.timeout, tools=self.tools,
+            model, self.messages, token=token, chat_type=chat_type,
+            proxy=proxy, timeout=timeout, tools=tools,
             conversation_id=self.conversation_id, parent_id=self.parent_id, **kwargs,
         ):
             yield event
