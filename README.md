@@ -4,6 +4,12 @@
 [![PyPI version](https://img.shields.io/pypi/v/qwen-reverse)](https://pypi.org/project/qwen-reverse/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.txt)
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/AnonymoDGH/Qwen-Reverse/main/assets/logo_edited.png" width="280" alt="qwen-reverse logo"/>
+  &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/AnonymoDGH/Qwen-Reverse/main/assets/demo.gif" width="480" alt="live streaming demo"/>
+</p>
+
 Reverse-engineered async Python client for [chat.qwen.ai](https://chat.qwen.ai) — text chat, streaming with real-time reasoning, tool calling, image and video generation. No official API key required (works anonymously).
 
 ```bash
@@ -15,7 +21,9 @@ pip install qwen-reverse
 - **Chat** — one-shot, streaming (SSE incremental), multi-turn with conversation memory (`conversation_id` / `parent_id` chaining)
 - **Real-time reasoning** — `reasoning` events streamed token-by-token before the answer, in both plain and multi-turn mode
 - **Tool calling** — OpenAI-style function definitions; either let the SDK execute them (JSON-stringified follow-up) or handle them yourself with `emit_tool_calls=True`
-- **Vision** — image upload + chat about it
+- **Vision** — image upload + chat about it (pass files/URLs/bytes)
+- **Image editing (i2i)** — `chat_type="image_edit"`: edit an uploaded image (add/remove/modify) and get back CDN URLs
+- **File upload** — `upload()` uploads local files (or URLs/bytes) into the web API for vision/editing chats
 - **Image / video generation** — t2i and t2v returning CDN URLs (`cdn.qwenlm.ai`)
 - **No account required** — the web API works without a token; OAuth device-flow login (`chat.qwen.ai` account) is also implemented
 - **Optional FastAPI server** — OpenAI-compatible `/v1/chat/completions` and `/v1/models` (see `server/`)
@@ -115,16 +123,68 @@ async def main():
 asyncio.run(main())
 ```
 
+### Upload a file + chat with vision
+
+```python
+import asyncio
+from qwen_reverse import Conversation
+
+async def main():
+    conv = Conversation(model="qwen3-vl-plus")  # a vision-capable model
+    reply = await conv.send(
+        "What is written on the whiteboard?",
+        files=["photo.jpg"],  # path | bytes | URL | already-uploaded dict
+    )
+    print(reply)
+
+asyncio.run(main())
+```
+
+`files` accepts local paths, raw `bytes`, `http(s)` URLs (downloaded then uploaded) or a pre-uploaded file dict. Use `upload()` to upload manually:
+
+```python
+import asyncio
+from qwen_reverse import upload
+
+async def main():
+    file_dict = await upload("diagram.png")        # -> {"id", "url", "type", ...}
+    # reuse file_dict in multiple chats without re-uploading
+asyncio.run(main())
+```
+
+### Edit an image (image-to-image)
+
+```python
+import asyncio
+from qwen_reverse import ImageEdit
+
+async def main():
+    img = ImageEdit()  # chat_type="image_edit"
+    urls = await img.edit(
+        "Add a bold arrow crossing through the logo from top-left to bottom-right, "
+        "keep the original violet symbol exactly the same",
+        "logo.png",                # path | bytes | URL | uploaded dict
+        aspect_ratio="1:1",
+    )
+    print(urls[0])  # edited image CDN URL
+
+asyncio.run(main())
+```
+
+You can also call `Generative(...).edit_image(prompt, image, aspect_ratio=...)` directly.
+
 ## API
 
 | Symbol | Description |
 |---|---|
 | `Generative(model=..., token=...)` | `.generate()`, `.stream()` (events: `reasoning`, `content`, `usage`, `tool_calls`, `done`) |
 | `Conversation(token=..., tools=...)` | `.send()`, `.stream()`, `.reset()` — persists `conversation_id`/`parent_id` across turns |
-| `Image(model=...)`, `Video(model=...)` | `.generate(prompt, aspect_ratio=...)` → list of CDN URLs |
+| `Image(model=...)`, `Video(model=...)`, `ImageEdit(model=...)` | `.generate(prompt, aspect_ratio=...)` → list of CDN URLs; `ImageEdit.edit(prompt, image, aspect_ratio=...)` for image-to-image editing |
 | `create_chat(model, messages, ...)` | low-level async generator; `conversation_id`/`parent_id` for multi-turn |
-| `fetch_models()` | available models (`qwen3.8-max`, `qwen3.7-plus`, `qwen3.7-max`, ...) |
-| `upload_file(...)` | upload images/files for vision chats |
+| `fetch_models()` | available models (`qwen3.8-max`, `qwen3.7-plus`, `qwen3-vl-plus`, ...) |
+| `upload(data, filename=...)` | upload a local path/bytes (or fetch+upload a URL) → file payload dict; returns the web-API file object |
+| `resolve_files(files)` | normalize a list of paths/bytes/URLs/dicts into upload-ready payload dicts |
+| `upload_file(...)` | low-level file upload (advanced: pass your own session/headers) |
 | `start_device_login()` / `complete_device_login(...)` | OAuth device flow |
 | `QwenOAuth2Client`, `SharedTokenManager` | token management |
 | `generate_cookies()` / `generate_fingerprint()` / `BXUAGenerator` | anti-bot primitives (cookies `ssxmod_itna`, `bx-umidtoken`, fingerprint) |

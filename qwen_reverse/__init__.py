@@ -1,3 +1,4 @@
+import os
 import re
 from typing import AsyncIterator, Optional
 
@@ -10,6 +11,8 @@ from .client import (
     create_chat,
     fetch_models,
     upload_file,
+    upload,
+    resolve_files,
     build_tool_system_prompt,
     inject_tools,
     parse_tool_response,
@@ -37,7 +40,7 @@ from .cookies import generate_cookies
 from .fingerprint import generate_fingerprint, parse_fingerprint
 from .bxua import BXUAGenerator, generate_bx_ua
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 _URL_RE = re.compile(r"https?://[^\s)\]]+")
 
@@ -121,6 +124,37 @@ class Generative:
                 urls.extend(_URL_RE.findall(event["data"]))
         return list(dict.fromkeys(urls))
 
+    async def edit_image(
+        self,
+        prompt: str,
+        image: str | os.PathLike | bytes | dict,
+        aspect_ratio: str = "1:1",
+        **kwargs,
+    ) -> list[str]:
+        """Edit an image (path / bytes / uploaded dict / URL) with a prompt.
+
+        Uses ``chat_type="image_edit"`` and streams the reference image to the
+        API as an attached file.
+        """
+        urls = []
+        model = kwargs.pop("model", self.model)
+        token = kwargs.pop("token", self.token)
+        proxy = kwargs.pop("proxy", self.proxy)
+        timeout = kwargs.pop("timeout", self.timeout)
+        aspect_ratio = kwargs.pop("aspect_ratio", aspect_ratio)
+        files = await resolve_files([image], token=token, proxy=proxy)
+        async for event in create_chat(
+            model, [{"role": "user", "content": prompt}],
+            token=token, chat_type="image_edit",
+            proxy=proxy, timeout=timeout,
+            files=files, aspect_ratio=aspect_ratio, **kwargs,
+        ):
+            if event["type"] == "image":
+                urls.append(event["data"]["url"])
+            elif event["type"] == "content":
+                urls.extend(_URL_RE.findall(event["data"]))
+        return list(dict.fromkeys(urls))
+
 
 class Image(Generative):
     def __init__(
@@ -134,6 +168,20 @@ class Image(Generative):
 
     async def generate(self, prompt: str, **kwargs) -> list[str]:
         return await self.generate_image(prompt, **kwargs)
+
+
+class ImageEdit(Generative):
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        proxy: Optional[str] = None,
+        model: str = DEFAULT_MODEL,
+        timeout: int = 600,
+    ):
+        super().__init__(model=model, token=token, chat_type="image_edit", proxy=proxy, timeout=timeout)
+
+    async def edit(self, prompt: str, image, **kwargs) -> list[str]:
+        return await self.edit_image(prompt, image, **kwargs)
 
 
 class Video(Generative):
@@ -170,17 +218,17 @@ class Conversation:
         self.conversation_id: Optional[str] = None
         self.parent_id: Optional[str] = None
 
-    async def send(self, prompt: str, **kwargs) -> str:
+    async def send(self, prompt: str, files: Optional[list] = None, **kwargs) -> str:
         parts = []
-        async for event in self.stream(prompt, **kwargs):
+        async for event in self.stream(prompt, files=files, **kwargs):
             if event["type"] == "content":
                 parts.append(event["data"])
         return "".join(parts)
 
-    def stream(self, prompt: str, **kwargs) -> AsyncIterator[dict]:
-        return self._stream(prompt, **kwargs)
+    def stream(self, prompt: str, files: Optional[list] = None, **kwargs) -> AsyncIterator[dict]:
+        return self._stream(prompt, files=files, **kwargs)
 
-    async def _stream(self, prompt: str, **kwargs) -> AsyncIterator[dict]:
+    async def _stream(self, prompt: str, files: Optional[list] = None, **kwargs) -> AsyncIterator[dict]:
         self.messages.append({"role": "user", "content": prompt})
         answer: list[str] = []
         model = kwargs.pop("model", self.model)
@@ -189,9 +237,10 @@ class Conversation:
         proxy = kwargs.pop("proxy", self.proxy)
         timeout = kwargs.pop("timeout", self.timeout)
         tools = kwargs.pop("tools", self.tools)
+        files = await resolve_files(files, token=token, proxy=proxy) if files else None
         async for event in create_chat(
             model, self.messages, token=token, chat_type=chat_type,
-            proxy=proxy, timeout=timeout, tools=tools,
+            proxy=proxy, timeout=timeout, tools=tools, files=files,
             conversation_id=self.conversation_id, parent_id=self.parent_id, **kwargs,
         ):
             yield event
@@ -213,7 +262,7 @@ __all__ = [
     "__version__",
     "QWEN_URL", "DEFAULT_HEADERS",
     "QwenError", "QwenAuthError", "QwenRateLimitError", "QwenOAuthError",
-    "create_chat", "fetch_models", "upload_file",
+    "create_chat", "fetch_models", "upload_file", "upload", "resolve_files",
     "build_tool_system_prompt", "inject_tools", "parse_tool_response", "execute_tool_call",
     "get_oss_headers",
     "QwenOAuth2Client", "SharedTokenManager", "start_device_login", "complete_device_login",
@@ -221,5 +270,5 @@ __all__ = [
     "text_models", "image_models", "vision_models", "models",
     "generate_cookies", "generate_fingerprint", "parse_fingerprint",
     "BXUAGenerator", "generate_bx_ua",
-    "Generative", "Conversation", "Image", "Video",
+    "Generative", "Conversation", "Image", "ImageEdit", "Video",
 ]

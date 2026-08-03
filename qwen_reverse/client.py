@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import uuid
 import asyncio
@@ -575,6 +576,58 @@ async def upload_file(
         "file_class": file_class,
         "uploadTaskId": str(uuid.uuid4()),
     }
+
+async def upload(
+    file: str | os.PathLike | bytes,
+    filename: Optional[str] = None,
+    token: Optional[str] = None,
+    proxy: Optional[str] = None,
+) -> dict:
+    """Upload a local file (path or raw bytes) and return the file payload dict.
+
+    High-level wrapper around :func:`upload_file` that builds headers and
+    a session internally, so callers only pass the file itself.
+    """
+    if isinstance(file, (str, os.PathLike)):
+        path = os.fspath(file)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        filename = filename or os.path.basename(path)
+    else:
+        data = bytes(file)
+    headers = _get_headers(token)
+    await _attach_extra_headers(headers, proxy)
+    async with aiohttp.ClientSession(headers=headers) as session:
+        return await upload_file(data, filename or f"file-{len(data)}", headers, session, proxy=proxy)
+
+async def resolve_files(
+    files: Optional[list],
+    token: Optional[str] = None,
+    proxy: Optional[str] = None,
+) -> list[dict]:
+    """Normalize mixed file inputs into upload-ready file payload dicts.
+
+    Accepted per item:
+      - dict            -> used as-is (already an upload payload)
+      - local path      -> uploaded via :func:`upload`
+      - http(s) URL     -> downloaded then uploaded
+      - bytes           -> uploaded with a generated filename
+    """
+    out: list[dict] = []
+    for item in files or []:
+        if isinstance(item, dict):
+            out.append(item)
+            continue
+        if isinstance(item, str) and item.startswith(("http://", "https://")):
+            async with aiohttp.ClientSession() as session:
+                async with session.get(item, proxy=proxy) as resp:
+                    await _raise_for_status(resp)
+                    data = await resp.read()
+            name = item.split("?")[0].rsplit("/", 1)[-1] or f"remote-{len(data)}"
+            out.append(await upload(data, name, token=token, proxy=proxy))
+            continue
+        out.append(await upload(item, token=token, proxy=proxy))
+    return out
 
 async def _send_message(
     model: str,
