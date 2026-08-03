@@ -42,8 +42,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/popbob/Qwen-Reverse"
-Repository = "https://github.com/popbob/Qwen-Reverse"
+Homepage = "https://github.com/AnonymoDGH/Qwen-Reverse"
+Repository = "https://github.com/AnonymoDGH/Qwen-Reverse"
 
 [tool.setuptools.packages.find]
 include = ["qwen_reverse*"]
