@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-reverse"
+version = "0.1.0"
+description = "Reverse-engineered Python client for Qwen web conversations (chat.qwen.ai) - text, vision, image & video generation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE.txt"]
+authors = [{ name = "Popbob" }]
+keywords = [
+    "qwen", "qwen3", "chat.qwen.ai", "reverse-engineered", "api",
+    "chatgpt-api-wrapper", "llm", "ai-chat", "image-generation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "aiohttp>=3.10.0",
+    "pycryptodome>=3.20.0",
+]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-dotenv>=1.0.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "build>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/popbob/Qwen-Reverse"
+Repository = "https://github.com/popbob/Qwen-Reverse"
+
+[tool.setuptools.packages.find]
+include = ["qwen_reverse*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
