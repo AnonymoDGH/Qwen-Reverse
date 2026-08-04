@@ -249,26 +249,32 @@ class SharedTokenManager:
             await self._release_lock(lock_path)
 
     async def _acquire_lock(self, lock_path: Path):
-        lock_id = str(uuid.uuid4())
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         for _ in range(50):
             try:
-                with open(lock_path, "w") as f:
-                    f.write(lock_id)
-                return
-            except OSError:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
                 try:
-                    age = int(time.time() * 1000) - int(lock_path.stat().st_mtime * 1000)
-                    if age > LOCK_TIMEOUT_MS:
-                        lock_path.unlink()
+                    age_ms = int(time.time() * 1000) - int(lock_path.stat().st_mtime * 1000)
+                    if age_ms > LOCK_TIMEOUT_MS:
+                        lock_path.unlink(missing_ok=True)
                 except OSError:
                     pass
                 await asyncio.sleep(0.2)
+                continue
+            except OSError:
+                await asyncio.sleep(0.2)
+                continue
+            try:
+                os.write(fd, str(uuid.uuid4()).encode())
+            finally:
+                os.close(fd)
+            return
         raise QwenOAuthError("Failed to acquire lock")
 
     async def _release_lock(self, lock_path: Path):
         try:
-            lock_path.unlink()
+            lock_path.unlink(missing_ok=True)
         except OSError:
             pass
 

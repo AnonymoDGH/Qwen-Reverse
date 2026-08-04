@@ -53,9 +53,14 @@ models = [
     'qwen3-max-2026-01-23', 'qwen-plus-2025-07-28', 'qwen3-coder-plus', 'qwen3-vl-plus',
     'qwen3-omni-flash-2025-12-01']
 
-#: Models that force thinking mode on regardless of reasoning_effort.
+#: Models that default to thinking-on only when no reasoning_effort is explicitly
+#: given. An explicit "none" disables thinking for all models (verified
+#: supported by chat.qwen.ai for every model).
 MODELS_REQUIRE_THINKING = [
     "qwen3.8-max-preview", "qwen3.8-max", "qwen3.7-plus", "qwen3.7-max", "qwen3.6-plus",
 ]
+
+#: Valid values for ``reasoning_effort``.
+REASONING_EFFORT_LEVELS = ("none", "low", "medium", "high")
 
 DEFAULT_MODEL = "qwen3.8-max"

@@ -7,13 +7,14 @@ import time
 import hashlib
 import hmac
 import datetime
-from typing import AsyncIterator, Optional, Literal
+from typing import Any, AsyncIterator, Optional, Literal
 from urllib.parse import quote
 
 import aiohttp
 
 from .cookies import generate_cookies
-from .models import MODELS_REQUIRE_THINKING
+from .bxua import generate_bx_ua
+from .models import MODELS_REQUIRE_THINKING, REASONING_EFFORT_LEVELS
 
 QWEN_URL = "https://chat.qwen.ai"
 
@@ -45,6 +46,7 @@ class QwenRateLimitError(QwenError):
 
 _midtoken: str | None = None
 _midtoken_uses: int = 0
+_midtoken_lock: asyncio.Lock = asyncio.Lock()
 
 def _get_headers(token: Optional[str] = None):
     data = generate_cookies()
@@ -66,31 +68,56 @@ async def _fetch_midtoken(proxy: Optional[str] = None) -> str:
 
 async def _attach_extra_headers(headers: dict, proxy: Optional[str] = None):
     global _midtoken, _midtoken_uses
-    if _midtoken is None or _midtoken_uses >= 100:
-        _midtoken = None
-        for _ in range(2):
-            try:
-                _midtoken = await _fetch_midtoken(proxy)
-                _midtoken_uses = 0
-                break
-            except Exception:
-                await asyncio.sleep(1)
-    _midtoken_uses += 1
-    if _midtoken:
-        headers['bx-umidtoken'] = _midtoken
+    async with _midtoken_lock:
+        if _midtoken is None or _midtoken_uses >= 100:
+            _midtoken = None
+            for _ in range(2):
+                try:
+                    _midtoken = await _fetch_midtoken(proxy)
+                    _midtoken_uses = 0
+                    break
+                except Exception:
+                    await asyncio.sleep(1)
+        if _midtoken is not None:
+            _midtoken_uses += 1
+            headers['bx-umidtoken'] = _midtoken
     headers['bx-v'] = '2.5.36'
     headers['x-request-id'] = str(uuid.uuid4())
+    # Regenerated per request, matching the web client's anti-bot behaviour.
+    headers['bx-ua'] = generate_bx_ua()
 
 async def _sse_stream(response: aiohttp.ClientResponse) -> AsyncIterator[dict]:
-    async for line in response.content:
-        if line.startswith(b"data:"):
-            rest = line[5:].strip()
-            if not rest or rest.startswith(b"[DONE]"):
-                continue
-            try:
-                yield json.loads(rest)
-            except json.JSONDecodeError:
-                continue
+    # Read line-by-line (not chunk-by-chunk): aiohttp's StreamReader yields
+    # arbitrary byte chunks via `async for`, which can split or merge SSE
+    # lines and silently drop/corrupt events. readline() guarantees one full
+    # line per call, including lines split across TCP segments.
+    buffer: list[str] = []
+    while True:
+        raw_line = await response.content.readline()
+        if not raw_line:
+            if buffer:
+                data = "\n".join(buffer)
+                buffer.clear()
+                if data != "[DONE]":
+                    try:
+                        yield json.loads(data)
+                    except json.JSONDecodeError:
+                        pass
+            return
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            if buffer:
+                data = "\n".join(buffer)
+                buffer.clear()
+                if data == "[DONE]":
+                    return
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    pass
+            continue
+        if line.startswith("data:"):
+            buffer.append(line[5:].lstrip())
 
 def _extract_text(content) -> str:
     if isinstance(content, str):
@@ -535,7 +562,9 @@ async def upload_file(
         res = await r.json()
         data_res = res.get("data")
         if res.get("success") is False:
-            raise QwenError(f"{data_res.get('code')}:{data_res.get('details')}")
+            code = data_res.get("code") if isinstance(data_res, dict) else None
+            details = data_res.get("details") if isinstance(data_res, dict) else None
+            raise QwenError(f"{code}:{details}")
         file_url = data_res.get("file_url")
         file_id = data_res.get("file_id")
     date_str = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -675,10 +704,13 @@ async def _send_message(
                     raise QwenError(f"Failed to create chat: {data}")
                 conversation_id = data['data']['id']
 
+        # The upstream API rejects stream=false with Bad_Request (verified
+        # live), so the payload always requests SSE.  The `stream` flag only
+        # affects how callers consume the yielded events.
         msg_payload = {
-            "stream": stream,
+            "stream": True,
             "version": "2.1",
-            "incremental_output": stream,
+            "incremental_output": True,
             "chat_id": conversation_id,
             "chat_mode": "normal",
             "model": model,
@@ -757,7 +789,52 @@ async def fetch_models(token: Optional[str] = None, proxy: Optional[str] = None)
         async with session.get(f'{QWEN_URL}/api/models', proxy=proxy) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            return [m["id"] for m in data.get("data", [])]
+            return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m]
+
+def _build_feature_config(
+    model: str,
+    reasoning_effort: Optional[str],
+    thinking_mode: Optional[str],
+) -> dict:
+    """Build the ``feature_config`` payload sent to chat.qwen.ai.
+
+    ``reasoning_effort`` must be one of ``REASONING_EFFORT_LEVELS``
+    (``none``, ``low``, ``medium``, ``high``).  An explicit ``"none"``
+    disables thinking for *all* models, including those in
+    ``MODELS_REQUIRE_THINKING``: the upstream API accepts
+    ``thinking_enabled: false`` everywhere (verified live).
+
+    For ``low``/``medium``/``high`` the SDK differentiates the
+    ``thinking_mode`` and ``thinking_budget`` so the API can tune
+    reasoning depth per level.
+    """
+    if reasoning_effort is not None and reasoning_effort.lower() not in REASONING_EFFORT_LEVELS:
+        raise QwenError(
+            f"Invalid reasoning_effort '{reasoning_effort}'. "
+            f"Must be one of: {', '.join(REASONING_EFFORT_LEVELS)}"
+        )
+
+    if not reasoning_effort or reasoning_effort.lower() == "none":
+        return {
+            "thinking_enabled": False,
+            "output_schema": "phase",
+            "thinking_budget": 81920,
+        }
+
+    effort = reasoning_effort.lower()
+    _thinking_mode = thinking_mode or ("Fast" if effort == "low" else "Auto")
+    auto_thinking = _thinking_mode == "Auto"
+    thinking_budget = {"low": 40960, "medium": 81920, "high": 163840}[effort]
+
+    return {
+        "auto_thinking": auto_thinking,
+        "thinking_mode": _thinking_mode,
+        "thinking_enabled": True,
+        "output_schema": "phase",
+        "research_mode": "normal",
+        "auto_search": True,
+        "thinking_budget": thinking_budget,
+    }
 
 async def create_chat(
     model: str,
@@ -775,28 +852,9 @@ async def create_chat(
     emit_tool_calls: bool = False,
     files: Optional[list[dict]] = None,
     aspect_ratio: Optional[Literal["1:1", "4:3", "3:4", "16:9", "9:16"]] = None,
+    **kwargs: Any,
 ) -> AsyncIterator[dict]:
-    enable_thinking = reasoning_effort and reasoning_effort.lower() != "none"
-    if model in MODELS_REQUIRE_THINKING:
-        enable_thinking = True
-        thinking_mode = "Auto"
-    _thinking_mode = thinking_mode or ("Auto" if enable_thinking else "Fast")
-    auto_thinking = _thinking_mode == "Auto"
-
-    feature_config = (
-        {
-            "auto_thinking": auto_thinking,
-            "thinking_mode": _thinking_mode,
-            "thinking_enabled": enable_thinking,
-            "output_schema": "phase",
-            "research_mode": "normal",
-            "auto_search": True,
-        } if enable_thinking else {
-            "thinking_enabled": enable_thinking,
-            "output_schema": "phase",
-            "thinking_budget": 81920,
-        }
-    )
+    feature_config = _build_feature_config(model, reasoning_effort, thinking_mode)
 
     tool_names = []
     if tools:
@@ -826,6 +884,7 @@ async def create_chat(
                 break
 
     _content_buffer: list[str] = []
+    _yielded_content = False
 
     for attempt in range(3):
         try:
@@ -836,94 +895,92 @@ async def create_chat(
             ):
                 if event["type"] == "content":
                     _content_buffer.append(event["data"])
-                elif event["type"] == "reasoning":
-                    yield event
-                elif event["type"] == "usage":
-                    yield event
-                elif event["type"] in ("image", "image_done"):
+                    if not tool_names:
+                        yield event
+                        _yielded_content = True
+                elif event["type"] in ("reasoning", "usage", "image", "image_done"):
                     yield event
                 elif event["type"] == "done":
+                    content = "".join(_content_buffer)
                     if tool_names:
-                        content = "".join(_content_buffer)
                         tool_calls = parse_tool_response(content, tool_names)
                         if tool_calls:
+                            conv_id = state.get("conv_id") or conversation_id or ""
+                            parent_id_out = state.get("parent_id_out") or parent_id or ""
                             if emit_tool_calls:
                                 yield {"type": "usage", "data": state.get("usage", {})}
                                 yield {"type": "tool_calls", "data": tool_calls}
-                                yield {"type": "done", "conversation_id": state.get("conv_id") or conversation_id or "", "parent_id": state.get("parent_id_out") or parent_id or ""}
+                                yield {"type": "done", "conversation_id": conv_id, "parent_id": parent_id_out}
                                 return
-                            for tc in tool_calls:
-                                tool_result = await execute_tool_call(tc, tools, None)
-                                for retry in range(3):
-                                    try:
-                                        state2: dict = {}
-                                        async for evt in _send_message(
-                                            model, state.get("conv_id") or conversation_id or "", state.get("parent_id_out") or parent_id or "",
-                                            f"Tool result: {tool_result}",
-                                            chat_type, feature_config, proxy, timeout, stream, token,
-                                            _state=state2,
-                                        ):
-                                            yield evt
-                                            if evt["type"] == "done":
-                                                break
-                                        yield {"type": "done", "conversation_id": state2.get("conv_id") or conversation_id or "", "parent_id": state2.get("parent_id_out") or parent_id or ""}
-                                        return
-                                    except (aiohttp.ClientResponseError, QwenRateLimitError) as e:
-                                        if "429" in str(e) or "RateLimited" in str(e):
-                                            await asyncio.sleep(2)
-                                            continue
-                                        raise e
-                    for chunk in _content_buffer:
-                        yield {"type": "content", "data": chunk}
+                            async for evt in _run_tool_calls(
+                                tool_calls, tools, model, conv_id, parent_id_out,
+                                chat_type, feature_config, proxy, timeout, stream, token,
+                            ):
+                                yield evt
+                            return
+                    if not _yielded_content:
+                        yield {"type": "content", "data": content}
                     yield {"type": "done", "conversation_id": state.get("conv_id") or conversation_id or "", "parent_id": state.get("parent_id_out") or parent_id or ""}
-                    break
-                else:
-                    yield event
+                    return
             break
         except (aiohttp.ClientResponseError, QwenRateLimitError) as e:
             if "429" in str(e) or "RateLimited" in str(e):
                 conversation_id = None
+                _content_buffer.clear()
+                _yielded_content = False
                 await asyncio.sleep(2)
                 continue
-            raise e
+            raise
     else:
         raise QwenRateLimitError("Rate limit exceeded after 3 attempts")
 
-    conv_id = state.get("conv_id", conversation_id or "")
-    parent_id_out = state.get("parent_id_out", parent_id or "")
-    content = "".join(_content_buffer)
-    usage = state.get("usage", {})
-
-    tool_calls = parse_tool_response(content, tool_names) if tool_names else None
-    if tool_calls:
-        if emit_tool_calls:
-            yield {"type": "usage", "data": usage}
-            yield {"type": "tool_calls", "data": tool_calls}
-            yield {"type": "done", "conversation_id": conv_id, "parent_id": parent_id_out}
-            return
+async def _run_tool_calls(
+    tool_calls: list[dict],
+    tools: list[dict] | None,
+    model: str,
+    conv_id: str,
+    parent_id_out: str,
+    chat_type: str,
+    feature_config: dict,
+    proxy: str | None,
+    timeout: int,
+    stream: bool,
+    token: str | None,
+) -> AsyncIterator[dict]:
+    async with aiohttp.ClientSession() as tool_session:
         for tc in tool_calls:
-            tool_result = await execute_tool_call(tc, tools, None)
-            for attempt in range(3):
+            # Pass a live session so URL-based tools are actually invoked
+            # (execute_tool_call needs a session to make the HTTP request).
+            tool_result = await execute_tool_call(tc, tools, tool_session)
+            for retry in range(3):
                 try:
                     state2: dict = {}
-                    async for event in _send_message(
+                    async for evt in _send_message(
                         model, conv_id, parent_id_out,
                         f"Tool result: {tool_result}",
                         chat_type, feature_config, proxy, timeout, stream, token,
                         _state=state2,
                     ):
-                        yield event
-                        if event["type"] == "done":
+                        yield evt
+                        if evt["type"] == "done":
                             break
-                    yield {"type": "done", "conversation_id": state2.get("conv_id") or conv_id or "", "parent_id": state2.get("parent_id_out") or parent_id_out or ""}
-                    return
+                    yield {
+                        "type": "done",
+                        "conversation_id": state2.get("conv_id") or conv_id or "",
+                        "parent_id": state2.get("parent_id_out") or parent_id_out or "",
+                    }
+                    break
                 except (aiohttp.ClientResponseError, QwenRateLimitError) as e:
                     if "429" in str(e) or "RateLimited" in str(e):
                         await asyncio.sleep(2)
                         continue
-                    raise e
+                    raise
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     raise QwenError(f"Follow-up failed: {e}")
+    return
+
 
 async def _raise_for_status(response: aiohttp.ClientResponse):
     status = response.status

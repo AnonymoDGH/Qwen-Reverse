@@ -40,7 +40,7 @@ from .cookies import generate_cookies
 from .fingerprint import generate_fingerprint, parse_fingerprint
 from .bxua import BXUAGenerator, generate_bx_ua
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 _URL_RE = re.compile(r"https?://[^\s)\]]+")
 

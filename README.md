@@ -201,7 +201,7 @@ asyncio.run(main())
 | `Generative(model=..., token=...)` | `.generate()`, `.stream()` (events: `reasoning`, `content`, `usage`, `tool_calls`, `done`) |
 | `Conversation(token=..., tools=..., proxy=...)` | `.send()`, `.stream()`, `.reset()` — persists `conversation_id` / `parent_id` across turns |
 | `Image(model=...)`, `Video(model=...)`, `ImageEdit(model=...)` | `.generate(prompt, aspect_ratio=...)` → list of CDN URLs; `ImageEdit.edit(prompt, image, aspect_ratio=...)` for image-to-image editing |
-| `create_chat(model, messages, ...)` | low-level async generator; `conversation_id` / `parent_id` for multi-turn |
+| `create_chat(model, messages, ...)` | low-level async generator; `conversation_id` / `parent_id` for multi-turn; `reasoning_effort` accepts `none` / `low` / `medium` / `high` |
 | `fetch_models()` | fetch available models (`qwen3.8-max`, `qwen3.7-plus`, `qwen3-vl-plus`, ...) |
 | `upload(data, filename=...)` | upload a local path/bytes (or fetch+upload a URL) → file payload dict |
 | `resolve_files(files)` | normalize a list of paths/bytes/URLs/dicts into upload-ready payload dicts |
@@ -239,17 +239,50 @@ pytest
 
 ---
 
-## Optional OpenAI-Compatible Server
+## Optional OpenAI + Anthropic-Compatible Server
+
+A FastAPI server that exposes `chat.qwen.ai` through standard APIs, so existing tools (Claude Code, OpenAI SDKs, Cursor, Gemini CLI, etc.) can use Qwen models without changes.
 
 ```bash
-pip install "qwen-reverse[server]"
-cd server
-uvicorn app.main:app --port 8000
-
-# GET  /v1/models
-# POST /v1/chat/completions  (OpenAI-style, streaming SSE)
+pip install -e .            # server deps (fastapi, uvicorn) are included
+qwen-reverse                # starts server, picks a free port, asks which agent to launch
+qwen-reverse --claude       # starts server + launches Claude Code pointed at it
+qwen-reverse --model qwen3.8-max-thinking   # model override for the launched agent
+python run.py               # same as `qwen-reverse` (repo checkout)
 ```
 
+The CLI (`qwen-reverse`) detects installed agents on your PATH and can launch them with the right env vars: `--claude`, `--gemini`, `--cursor`, `--qwen`, `--opencode`, `--aider`, plus `--openai` to print the OpenAI-compatible setup, `--port`, `--host`, `--no-server`.
+
+### Endpoints
+
+| Endpoint | Protocol | Notes |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI | streaming SSE + non-streaming, `reasoning_content`, tool calls |
+| `POST /v1/completions` | OpenAI (legacy) | wraps chat completions with a plain `prompt` |
+| `POST /v1/embeddings` | OpenAI | placeholder vectors (no real embedding backend) |
+| `GET /v1/models` | OpenAI | base models + `-search` / `-thinking` / `-web-dev` / `-deep-research` / `-artifacts` / `-slides` variants |
+| `POST /v1/messages` | Anthropic | streaming + non-streaming, translated to Anthropic SSE (`thinking` blocks) |
+| `POST /v1/images/generations` | OpenAI | text-to-image → CDN URLs |
+| `POST /v1/images/edits` | OpenAI | image editing (multipart or JSON) → CDN URLs |
+| `GET /health` | — | liveness probe |
+
+Anthropic model names are mapped automatically (`claude-opus-4-6` → `qwen3.8-max`), and model suffixes select special modes: `-thinking` (reasoning_effort=high), `-search`, `-web-dev`, `-deep-research`, `-artifacts`, `-slides`, `-image`/`-t2i`, `-video`/`-t2v`.
+
+```bash
+# manual start (repo checkout):
+uvicorn qwen_reverse.server.app:app --host 127.0.0.1 --port 8090
+```
+
+### Using it with Claude Code
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8090
+export ANTHROPIC_API_KEY=qwen-reverse
+export ANTHROPIC_MODEL=claude-opus-4-6-thinking   # or any claude-* name, or qwen names with suffixes
+claude
+```
+
+---
 ---
 
 ## How It Works
