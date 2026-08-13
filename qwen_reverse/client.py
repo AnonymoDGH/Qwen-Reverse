@@ -255,6 +255,40 @@ def _extract_balanced_json(s: str, start: int) -> tuple[str, int]:
         i += 1
     return s[start:].strip(), len(s)
 
+_TOOL_RESULT_PREVIEW_CHARS = 2000
+
+
+async def _build_tool_result_context(
+    name: str,
+    tool_result: str,
+    max_chars: int,
+    token: Optional[str] = None,
+    proxy: Optional[str] = None,
+) -> tuple[str, list | None]:
+    """Build the follow-up prompt for a tool result.
+
+    Short results are inlined as text. Results longer than ``max_chars`` are
+    uploaded as a text file (via :func:`upload`) and attached through
+    ``files``, keeping the chat payload small; only a preview is sent inline.
+    """
+    if not max_chars or len(tool_result) <= max_chars:
+        return f"Tool result: {tool_result}", None
+    file_payload = await upload(
+        tool_result.encode("utf-8"),
+        filename=f"tool_result_{name}.txt",
+        token=token,
+        proxy=proxy,
+    )
+    preview = tool_result[:_TOOL_RESULT_PREVIEW_CHARS]
+    prompt = (
+        f"The tool '{name}' returned a large result "
+        f"({len(tool_result)} characters) that was uploaded as a file "
+        f"named '{file_payload['name']}'. Read the attached file for the "
+        f"full result.\n\nPreview:\n{preview}"
+    )
+    return prompt, [file_payload]
+
+
 def _parse_stringified_tool_calls(text: str) -> list[dict]:
     calls = []
     if not text:
@@ -607,12 +641,12 @@ async def upload_file(
     }
 
 async def upload(
-    file: str | os.PathLike | bytes,
+    file: str | bytes | os.PathLike,
     filename: Optional[str] = None,
     token: Optional[str] = None,
     proxy: Optional[str] = None,
 ) -> dict:
-    """Upload a local file (path or raw bytes) and return the file payload dict.
+    """Upload a file to Qwen and return the upload payload dict.
 
     High-level wrapper around :func:`upload_file` that builds headers and
     a session internally, so callers only pass the file itself.
@@ -628,6 +662,29 @@ async def upload(
     await _attach_extra_headers(headers, proxy)
     async with aiohttp.ClientSession(headers=headers) as session:
         return await upload_file(data, filename or f"file-{len(data)}", headers, session, proxy=proxy)
+
+async def _build_tool_result_context(
+    tool_name: str,
+    result: str,
+    max_chars: int,
+    token: Optional[str] = None,
+    proxy: Optional[str] = None,
+) -> tuple[str, Optional[list[dict]]]:
+    """Build the prompt and optional files for a tool result.
+    
+    If the result exceeds max_chars (and max_chars is not None), upload it as a file.
+    Returns (prompt, files) tuple.
+    """
+    if max_chars is not None and len(result) > max_chars:
+        # Upload large result as file
+        filename = f"tool_result_{tool_name}.txt"
+        uploaded = await upload(result.encode("utf-8"), filename=filename, token=token, proxy=proxy)
+        prompt = f"The tool {tool_name} returned a large result ({len(result)} chars). It has been uploaded as a file: {filename}"
+        return prompt, [uploaded]
+    else:
+        # Keep small result inline
+        prompt = f"Tool result: {result}"
+        return prompt, None
 
 async def resolve_files(
     files: Optional[list],
@@ -852,6 +909,7 @@ async def create_chat(
     emit_tool_calls: bool = False,
     files: Optional[list[dict]] = None,
     aspect_ratio: Optional[Literal["1:1", "4:3", "3:4", "16:9", "9:16"]] = None,
+    max_tool_result_chars: int = 30_000,
     **kwargs: Any,
 ) -> AsyncIterator[dict]:
     feature_config = _build_feature_config(model, reasoning_effort, thinking_mode)
@@ -915,6 +973,7 @@ async def create_chat(
                             async for evt in _run_tool_calls(
                                 tool_calls, tools, model, conv_id, parent_id_out,
                                 chat_type, feature_config, proxy, timeout, stream, token,
+                                max_tool_result_chars=max_tool_result_chars,
                             ):
                                 yield evt
                             return
@@ -946,20 +1005,26 @@ async def _run_tool_calls(
     timeout: int,
     stream: bool,
     token: str | None,
+    max_tool_result_chars: int = 30_000,
 ) -> AsyncIterator[dict]:
     async with aiohttp.ClientSession() as tool_session:
         for tc in tool_calls:
             # Pass a live session so URL-based tools are actually invoked
             # (execute_tool_call needs a session to make the HTTP request).
             tool_result = await execute_tool_call(tc, tools, tool_session)
+            name = tc.get("function", {}).get("name", "unknown") if isinstance(tc, dict) else "unknown"
+            prompt, files = await _build_tool_result_context(
+                name, tool_result, max_tool_result_chars, token=token, proxy=proxy,
+            )
+            
             for retry in range(3):
                 try:
                     state2: dict = {}
                     async for evt in _send_message(
                         model, conv_id, parent_id_out,
-                        f"Tool result: {tool_result}",
+                        prompt,
                         chat_type, feature_config, proxy, timeout, stream, token,
-                        _state=state2,
+                        files=files, _state=state2,
                     ):
                         yield evt
                         if evt["type"] == "done":

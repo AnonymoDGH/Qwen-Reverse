@@ -54,6 +54,7 @@ In-depth stress testing on the live `chat.qwen.ai` backend reveals the following
 - **Image / video generation** — t2i and t2v returning CDN URLs (`cdn.qwenlm.ai`)
 - **No account required** — the web API works without a token; OAuth device-flow login (`chat.qwen.ai` account) is also implemented
 - **Anti-Bot & WAF Evasion** — built-in `BXUAGenerator` (cryptographic `bx-ua` header generation), browser fingerprinting, and session cookie handling (`ssxmod_itna`)
+- **Large tool-result upload** — when a tool returns a very long result it is uploaded as a text file and attached via `files` (keeping the chat payload small); only a preview is sent inline. Threshold is configurable with `max_tool_result_chars` (default 30 000; pass `None` to disable).
 - **Optional FastAPI server** — OpenAI-compatible `/v1/chat/completions` and `/v1/models` (see `server/`)
 
 ---
@@ -201,7 +202,7 @@ asyncio.run(main())
 | `Generative(model=..., token=...)` | `.generate()`, `.stream()` (events: `reasoning`, `content`, `usage`, `tool_calls`, `done`) |
 | `Conversation(token=..., tools=..., proxy=...)` | `.send()`, `.stream()`, `.reset()` — persists `conversation_id` / `parent_id` across turns |
 | `Image(model=...)`, `Video(model=...)`, `ImageEdit(model=...)` | `.generate(prompt, aspect_ratio=...)` → list of CDN URLs; `ImageEdit.edit(prompt, image, aspect_ratio=...)` for image-to-image editing |
-| `create_chat(model, messages, ...)` | low-level async generator; `conversation_id` / `parent_id` for multi-turn; `reasoning_effort` accepts `none` / `low` / `medium` / `high` |
+| `create_chat(model, messages, ...)` | low-level async generator; `conversation_id` / `parent_id` for multi-turn; `reasoning_effort` accepts `none` / `low` / `medium` / `high`; `max_tool_result_chars` uploads oversized tool results as files |
 | `fetch_models()` | fetch available models (`qwen3.8-max`, `qwen3.7-plus`, `qwen3-vl-plus`, ...) |
 | `upload(data, filename=...)` | upload a local path/bytes (or fetch+upload a URL) → file payload dict |
 | `resolve_files(files)` | normalize a list of paths/bytes/URLs/dicts into upload-ready payload dicts |

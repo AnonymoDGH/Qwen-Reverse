@@ -187,3 +187,118 @@ async def test_multiple_tool_calls_all_executed():
     tool_result_prompts = [p for p in call_log if "Tool result" in p]
     assert len(tool_result_prompts) == 2, tool_result_prompts
     assert any(e["type"] == "content" and e["data"] == "ok" for e in events)
+
+
+async def test_large_tool_result_uploaded_as_file():
+    initial_chunks = [
+        {"type": "content", "data": '{"tool_calls": [{"name": "get_weather", "arguments": {"city": "BA"}}]}'},
+        {"type": "done"},
+    ]
+    followup_chunks = [{"type": "content", "data": "ok"}, {"type": "done"}]
+
+    large_result = "x" * 40_000
+    sent = {}
+
+    async def fake_send_message(model, conv, parent, prompt, *args, _state=None, **kwargs):
+        sent["prompt"] = prompt
+        sent["files"] = kwargs.get("files")
+        if _state is not None:
+            _state.update(_state_with(conv or "c1", parent or "p1"))
+        if "Tool result" in prompt or "uploaded as a file" in prompt:
+            for chunk in followup_chunks:
+                yield chunk
+        else:
+            for chunk in initial_chunks:
+                yield chunk
+
+    with patch.object(client_mod, "_send_message", side_effect=fake_send_message):
+        with patch.object(client_mod, "execute_tool_call", new=AsyncMock(return_value=large_result)):
+            with patch.object(client_mod, "upload", new=AsyncMock(return_value={"name": "tool_result_get_weather.txt", "id": "f1"})) as mock_upload:
+                events = await _collect(create_chat(
+                    "qwen3.8-max",
+                    [{"role": "user", "content": "weather?"}],
+                    tools=[WEATHER_TOOL],
+                    max_tool_result_chars=1_000,
+                ))
+
+    assert any(e["type"] == "content" and e["data"] == "ok" for e in events)
+    assert mock_upload.await_count == 1
+    uploaded = mock_upload.await_args
+    assert uploaded.args[0] == large_result.encode("utf-8")
+    assert uploaded.kwargs["filename"] == "tool_result_get_weather.txt"
+    assert sent["files"] and sent["files"][0]["name"] == "tool_result_get_weather.txt"
+    assert "uploaded as a file" in sent["prompt"]
+    assert len(sent["prompt"]) < 5_000
+
+
+async def test_small_tool_result_not_uploaded():
+    initial_chunks = [
+        {"type": "content", "data": '{"tool_calls": [{"name": "get_weather", "arguments": {"city": "BA"}}]}'},
+        {"type": "done"},
+    ]
+    followup_chunks = [{"type": "content", "data": "ok"}, {"type": "done"}]
+
+    sent = {}
+
+    async def fake_send_message(model, conv, parent, prompt, *args, _state=None, **kwargs):
+        sent["prompt"] = prompt
+        sent["files"] = kwargs.get("files")
+        if _state is not None:
+            _state.update(_state_with(conv or "c1", parent or "p1"))
+        if "Tool result" in prompt or "uploaded as a file" in prompt:
+            for chunk in followup_chunks:
+                yield chunk
+        else:
+            for chunk in initial_chunks:
+                yield chunk
+
+    with patch.object(client_mod, "_send_message", side_effect=fake_send_message):
+        with patch.object(client_mod, "execute_tool_call", new=AsyncMock(return_value='{"result":"27C"}')):
+            with patch.object(client_mod, "upload", new=AsyncMock()) as mock_upload:
+                events = await _collect(create_chat(
+                    "qwen3.8-max",
+                    [{"role": "user", "content": "weather?"}],
+                    tools=[WEATHER_TOOL],
+                    max_tool_result_chars=1_000,
+                ))
+
+    assert any(e["type"] == "content" and e["data"] == "ok" for e in events)
+    assert mock_upload.await_count == 0
+    assert sent["files"] is None
+    assert "27C" in sent["prompt"]
+
+
+async def test_upload_disabled_with_none_threshold():
+    initial_chunks = [
+        {"type": "content", "data": '{"tool_calls": [{"name": "get_weather", "arguments": {"city": "BA"}}]}'},
+        {"type": "done"},
+    ]
+    followup_chunks = [{"type": "content", "data": "ok"}, {"type": "done"}]
+
+    sent = {}
+
+    async def fake_send_message(model, conv, parent, prompt, *args, _state=None, **kwargs):
+        sent["prompt"] = prompt
+        sent["files"] = kwargs.get("files")
+        if _state is not None:
+            _state.update(_state_with(conv or "c1", parent or "p1"))
+        if "Tool result" in prompt or "uploaded as a file" in prompt:
+            for chunk in followup_chunks:
+                yield chunk
+        else:
+            for chunk in initial_chunks:
+                yield chunk
+
+    with patch.object(client_mod, "_send_message", side_effect=fake_send_message):
+        with patch.object(client_mod, "execute_tool_call", new=AsyncMock(return_value="y" * 40_000)):
+            with patch.object(client_mod, "upload", new=AsyncMock()) as mock_upload:
+                events = await _collect(create_chat(
+                    "qwen3.8-max",
+                    [{"role": "user", "content": "weather?"}],
+                    tools=[WEATHER_TOOL],
+                    max_tool_result_chars=None,
+                ))
+
+    assert any(e["type"] == "content" and e["data"] == "ok" for e in events)
+    assert mock_upload.await_count == 0
+    assert "uploaded as a file" not in sent["prompt"]

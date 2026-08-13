@@ -40,7 +40,7 @@ from .cookies import generate_cookies
 from .fingerprint import generate_fingerprint, parse_fingerprint
 from .bxua import BXUAGenerator, generate_bx_ua
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 _URL_RE = re.compile(r"https?://[^\s)\]]+")
 
@@ -207,6 +207,7 @@ class Conversation:
         proxy: Optional[str] = None,
         timeout: int = 300,
         tools: Optional[list] = None,
+        max_tool_result_chars: int = 30_000,
     ):
         self.model = model
         self.token = token
@@ -214,6 +215,7 @@ class Conversation:
         self.proxy = proxy
         self.timeout = timeout
         self.tools = tools
+        self.max_tool_result_chars = max_tool_result_chars
         self.messages: list[dict] = []
         self.conversation_id: Optional[str] = None
         self.parent_id: Optional[str] = None
@@ -237,10 +239,12 @@ class Conversation:
         proxy = kwargs.pop("proxy", self.proxy)
         timeout = kwargs.pop("timeout", self.timeout)
         tools = kwargs.pop("tools", self.tools)
+        max_tool_result_chars = kwargs.pop("max_tool_result_chars", self.max_tool_result_chars)
         files = await resolve_files(files, token=token, proxy=proxy) if files else None
         async for event in create_chat(
             model, self.messages, token=token, chat_type=chat_type,
             proxy=proxy, timeout=timeout, tools=tools, files=files,
+            max_tool_result_chars=max_tool_result_chars,
             conversation_id=self.conversation_id, parent_id=self.parent_id, **kwargs,
         ):
             yield event
