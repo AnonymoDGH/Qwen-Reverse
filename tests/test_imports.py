@@ -2,7 +2,7 @@ import qwen_reverse
 
 
 def test_version():
-    assert qwen_reverse.__version__ == "0.1.4"
+    assert qwen_reverse.__version__ == "0.1.5"
 
 
 def test_public_exports_exist():
@@ -187,3 +187,75 @@ def test_conversation_files_passed(monkeypatch):
 def test_upload_and_resolve_files_public():
     assert callable(qwen_reverse.upload)
     assert callable(qwen_reverse.resolve_files)
+
+
+def test_alist_helper():
+    import asyncio
+
+    async def gen():
+        yield 1
+        yield 2
+        yield 3
+
+    assert asyncio.run(qwen_reverse.alist(gen())) == [1, 2, 3]
+
+
+def test_conversation_async_context_manager():
+    import asyncio
+
+    async def run():
+        async with qwen_reverse.Conversation() as conv:
+            conv.messages.append({"role": "user", "content": "x"})
+            conv.conversation_id = "abc"
+            assert conv.messages == [{"role": "user", "content": "x"}]
+        # __aexit__ resets state
+        assert conv.messages == []
+        assert conv.conversation_id is None
+
+    asyncio.run(run())
+
+
+def test_generative_reasoning_effort_instance_defaults():
+    gen = qwen_reverse.Generative(reasoning_effort="medium")
+    assert gen.reasoning_effort == "medium"
+    gen2 = qwen_reverse.Generative()
+    assert gen2.reasoning_effort is None
+
+
+def test_generative_generate_passes_reasoning_effort(monkeypatch):
+    import asyncio
+
+    seen = {}
+
+    async def fake_create_chat(model, messages, **kwargs):
+        seen["reasoning_effort"] = kwargs.get("reasoning_effort")
+        seen["thinking_mode"] = kwargs.get("thinking_mode")
+        yield {"type": "content", "data": "hi"}
+
+    monkeypatch.setattr(qwen_reverse, "create_chat", fake_create_chat)
+    gen = qwen_reverse.Generative(reasoning_effort="high", thinking_mode="Thinking")
+
+    result = asyncio.run(gen.generate("x"))
+    assert result == "hi"
+    assert seen["reasoning_effort"] == "high"
+    assert seen["thinking_mode"] == "Thinking"
+
+
+def test_conversation_reasoning_effort_passed(monkeypatch):
+    import asyncio
+
+    seen = {}
+
+    async def fake_create_chat(model, messages, **kwargs):
+        seen["reasoning_effort"] = kwargs.get("reasoning_effort")
+        seen["thinking_mode"] = kwargs.get("thinking_mode")
+        yield {"type": "content", "data": "ok"}
+        yield {"type": "done", "conversation_id": "c1", "parent_id": "p1"}
+
+    monkeypatch.setattr(qwen_reverse, "create_chat", fake_create_chat)
+    conv = qwen_reverse.Conversation(reasoning_effort="low", thinking_mode="Fast")
+
+    result = asyncio.run(conv.send("x"))
+    assert result == "ok"
+    assert seen["reasoning_effort"] == "low"
+    assert seen["thinking_mode"] == "Fast"

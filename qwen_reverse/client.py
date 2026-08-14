@@ -31,7 +31,7 @@ DEFAULT_HEADERS = {
     'Connection': 'keep-alive',
     'X-Requested-With': 'XMLHttpRequest',
     'source': 'web',
-    'version': '0.2.63',
+    'version': '0.2.84',
     'X-Accel-Buffering': 'no',
 }
 
@@ -42,7 +42,9 @@ class QwenAuthError(QwenError):
     pass
 
 class QwenRateLimitError(QwenError):
-    pass
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 _midtoken: str | None = None
 _midtoken_uses: int = 0
@@ -57,7 +59,8 @@ def _get_headers(token: Optional[str] = None):
     return headers
 
 async def _fetch_midtoken(proxy: Optional[str] = None) -> str:
-    async with aiohttp.ClientSession() as s:
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
         async with s.get('https://sg-wum.alibaba.com/w/wu.json', proxy=proxy) as r:
             r.raise_for_status()
             text = await r.text()
@@ -81,7 +84,7 @@ async def _attach_extra_headers(headers: dict, proxy: Optional[str] = None):
         if _midtoken is not None:
             _midtoken_uses += 1
             headers['bx-umidtoken'] = _midtoken
-    headers['bx-v'] = '2.5.36'
+    headers['bx-v'] = '2.5.37'
     headers['x-request-id'] = str(uuid.uuid4())
     # Regenerated per request, matching the web client's anti-bot behaviour.
     headers['bx-ua'] = generate_bx_ua()
@@ -591,6 +594,7 @@ async def upload_file(
         f'{QWEN_URL}/api/v2/files/getstsToken',
         json={"filename": filename, "filesize": len(data), "filetype": file_type},
         proxy=proxy,
+        timeout=aiohttp.ClientTimeout(total=30),
     ) as r:
         await _raise_for_status(r)
         res = await r.json()
@@ -603,7 +607,8 @@ async def upload_file(
         file_id = data_res.get("file_id")
     date_str = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     oss_headers = get_oss_headers('PUT', date_str, data_res, file_type)
-    async with session.put(file_url.split("?")[0], data=data, headers=oss_headers, proxy=proxy) as resp:
+    async with session.put(file_url.split("?")[0], data=data, headers=oss_headers, proxy=proxy,
+                           timeout=aiohttp.ClientTimeout(total=300)) as resp:
         await _raise_for_status(resp)
     if "image" in file_type:
         file_class, _type, show_type = "vision", "image", "image"
@@ -640,6 +645,17 @@ async def upload_file(
         "uploadTaskId": str(uuid.uuid4()),
     }
 
+async def _upload_bytes(
+    data: bytes,
+    filename: Optional[str],
+    headers: dict,
+    session: aiohttp.ClientSession,
+    proxy: Optional[str] = None,
+) -> dict:
+    """Upload raw bytes through a shared session (used by upload / resolve_files)."""
+    return await upload_file(data, filename or f"file-{len(data)}", headers, session, proxy=proxy)
+
+
 async def upload(
     file: str | bytes | os.PathLike,
     filename: Optional[str] = None,
@@ -660,31 +676,21 @@ async def upload(
         data = bytes(file)
     headers = _get_headers(token)
     await _attach_extra_headers(headers, proxy)
-    async with aiohttp.ClientSession(headers=headers) as session:
-        return await upload_file(data, filename or f"file-{len(data)}", headers, session, proxy=proxy)
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        return await _upload_bytes(data, filename, headers, session, proxy=proxy)
 
-async def _build_tool_result_context(
-    tool_name: str,
-    result: str,
-    max_chars: int,
-    token: Optional[str] = None,
-    proxy: Optional[str] = None,
-) -> tuple[str, Optional[list[dict]]]:
-    """Build the prompt and optional files for a tool result.
-    
-    If the result exceeds max_chars (and max_chars is not None), upload it as a file.
-    Returns (prompt, files) tuple.
-    """
-    if max_chars is not None and len(result) > max_chars:
-        # Upload large result as file
-        filename = f"tool_result_{tool_name}.txt"
-        uploaded = await upload(result.encode("utf-8"), filename=filename, token=token, proxy=proxy)
-        prompt = f"The tool {tool_name} returned a large result ({len(result)} chars). It has been uploaded as a file: {filename}"
-        return prompt, [uploaded]
-    else:
-        # Keep small result inline
-        prompt = f"Tool result: {result}"
-        return prompt, None
+
+async def _read_file_or_bytes(item) -> tuple[bytes, str]:
+    if isinstance(item, str):
+        with open(item, "rb") as fh:
+            return fh.read(), item
+    if isinstance(item, os.PathLike):
+        path = os.fspath(item)
+        with open(path, "rb") as fh:
+            return fh.read(), path
+    return bytes(item), f"file-{len(bytes(item))}"
+
 
 async def resolve_files(
     files: Optional[list],
@@ -698,21 +704,39 @@ async def resolve_files(
       - local path      -> uploaded via :func:`upload`
       - http(s) URL     -> downloaded then uploaded
       - bytes           -> uploaded with a generated filename
+
+    A single HTTP session is reused across all uploads/downloads.
     """
     out: list[dict] = []
-    for item in files or []:
-        if isinstance(item, dict):
-            out.append(item)
-            continue
-        if isinstance(item, str) and item.startswith(("http://", "https://")):
-            async with aiohttp.ClientSession() as session:
+    items = list(files or [])
+    if not items:
+        return out
+
+    def is_url(item) -> bool:
+        return isinstance(item, str) and item.startswith(("http://", "https://"))
+
+    if any(not isinstance(item, dict) for item in items):
+        headers = _get_headers(token)
+        await _attach_extra_headers(headers, proxy)
+        timeout = aiohttp.ClientTimeout(total=120)
+    else:
+        headers, timeout = {}, None
+
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        for item in items:
+            if isinstance(item, dict):
+                out.append(item)
+                continue
+            if is_url(item):
                 async with session.get(item, proxy=proxy) as resp:
                     await _raise_for_status(resp)
                     data = await resp.read()
-            name = item.split("?")[0].rsplit("/", 1)[-1] or f"remote-{len(data)}"
-            out.append(await upload(data, name, token=token, proxy=proxy))
-            continue
-        out.append(await upload(item, token=token, proxy=proxy))
+                name = item.split("?")[0].rsplit("/", 1)[-1] or f"remote-{len(data)}"
+                out.append(await _upload_bytes(data, name, headers, session, proxy=proxy))
+                continue
+            data, path = await _read_file_or_bytes(item)
+            name = path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] if isinstance(path, str) else None
+            out.append(await _upload_bytes(data, name, headers, session, proxy=proxy))
     return out
 
 async def _send_message(
@@ -732,6 +756,7 @@ async def _send_message(
 ) -> AsyncIterator[dict]:
     message_id = str(uuid.uuid4())
     now = int(time.time() * 1000)
+    chat_mode = "guest" if not token else "normal"
 
     headers = _get_headers(token)
     await _attach_extra_headers(headers, proxy)
@@ -741,12 +766,13 @@ async def _send_message(
             chat_payload = {
                 "title": "New Chat",
                 "models": [model],
-                "chat_mode": "normal",
+                "chat_mode": chat_mode,
                 "chat_type": chat_type,
                 "timestamp": now,
                 "project_id": "",
             }
-            async with session.post(f'{QWEN_URL}/api/v2/chats/new', json=chat_payload, proxy=proxy) as resp:
+            async with session.post(f'{QWEN_URL}/api/v2/chats/new', json=chat_payload, proxy=proxy,
+                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
                     text = await resp.text()
                     if text.strip().startswith('<'):
@@ -769,7 +795,7 @@ async def _send_message(
             "version": "2.1",
             "incremental_output": True,
             "chat_id": conversation_id,
-            "chat_mode": "normal",
+            "chat_mode": chat_mode,
             "model": model,
             "parent_id": parent_id,
             "messages": [
@@ -875,6 +901,7 @@ def _build_feature_config(
         return {
             "thinking_enabled": False,
             "output_schema": "phase",
+            "thinking_format": "summary",
             "thinking_budget": 81920,
         }
 
@@ -888,6 +915,7 @@ def _build_feature_config(
         "thinking_mode": _thinking_mode,
         "thinking_enabled": True,
         "output_schema": "phase",
+        "thinking_format": "summary",
         "research_mode": "normal",
         "auto_search": True,
         "thinking_budget": thinking_budget,
@@ -983,7 +1011,7 @@ async def create_chat(
                     return
             break
         except (aiohttp.ClientResponseError, QwenRateLimitError) as e:
-            if "429" in str(e) or "RateLimited" in str(e):
+            if e.status == 429 or "429" in str(e) or "RateLimited" in str(e):
                 conversation_id = None
                 _content_buffer.clear()
                 _yielded_content = False
@@ -1026,9 +1054,9 @@ async def _run_tool_calls(
                         chat_type, feature_config, proxy, timeout, stream, token,
                         files=files, _state=state2,
                     ):
-                        yield evt
                         if evt["type"] == "done":
                             break
+                        yield evt
                     yield {
                         "type": "done",
                         "conversation_id": state2.get("conv_id") or conv_id or "",
@@ -1036,7 +1064,7 @@ async def _run_tool_calls(
                     }
                     break
                 except (aiohttp.ClientResponseError, QwenRateLimitError) as e:
-                    if "429" in str(e) or "RateLimited" in str(e):
+                    if e.status == 429 or "429" in str(e) or "RateLimited" in str(e):
                         await asyncio.sleep(2)
                         continue
                     raise
@@ -1050,7 +1078,7 @@ async def _run_tool_calls(
 async def _raise_for_status(response: aiohttp.ClientResponse):
     status = response.status
     if status == 429:
-        raise QwenRateLimitError(f"Rate limited (status {status})")
+        raise QwenRateLimitError(f"Rate limited (status {status})", status=status)
     if status == 401:
         raise QwenAuthError(f"Unauthorized (status {status})")
     if 200 <= status < 300:

@@ -62,5 +62,5 @@ async def test_headers_always_get_bx_v_and_request_id():
     with patch.object(client_mod, "_fetch_midtoken", side_effect=fake_fetch):
         h = {}
         await client_mod._attach_extra_headers(h, None)
-        assert h["bx-v"] == "2.5.36"
+        assert h["bx-v"] == "2.5.37"
         assert h["x-request-id"]

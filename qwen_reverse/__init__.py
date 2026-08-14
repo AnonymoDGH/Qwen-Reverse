@@ -39,6 +39,7 @@ from .models import (
 from .cookies import generate_cookies
 from .fingerprint import generate_fingerprint, parse_fingerprint
 from .bxua import BXUAGenerator, generate_bx_ua
+from .tts import TTS, tts, stream_audio, fetch_tts_config
 
 __version__ = "0.1.5"
 
@@ -53,12 +54,16 @@ class Generative:
         chat_type: str = "t2t",
         proxy: Optional[str] = None,
         timeout: int = 300,
+        reasoning_effort: Optional[str] = None,
+        thinking_mode: Optional[str] = None,
     ):
         self.model = model
         self.token = token
         self.chat_type = chat_type
         self.proxy = proxy
         self.timeout = timeout
+        self.reasoning_effort = reasoning_effort
+        self.thinking_mode = thinking_mode
 
     async def generate(self, prompt: str, **kwargs) -> str:
         parts = []
@@ -67,10 +72,13 @@ class Generative:
         proxy = kwargs.pop("proxy", self.proxy)
         timeout = kwargs.pop("timeout", self.timeout)
         chat_type = kwargs.pop("chat_type", self.chat_type)
+        reasoning_effort = kwargs.pop("reasoning_effort", self.reasoning_effort)
+        thinking_mode = kwargs.pop("thinking_mode", self.thinking_mode)
         async for event in create_chat(
             model, [{"role": "user", "content": prompt}],
             token=token, chat_type=chat_type,
-            proxy=proxy, timeout=timeout, **kwargs,
+            proxy=proxy, timeout=timeout,
+            reasoning_effort=reasoning_effort, thinking_mode=thinking_mode, **kwargs,
         ):
             if event["type"] == "content":
                 parts.append(event["data"])
@@ -82,10 +90,13 @@ class Generative:
         proxy = kwargs.pop("proxy", self.proxy)
         timeout = kwargs.pop("timeout", self.timeout)
         chat_type = kwargs.pop("chat_type", self.chat_type)
+        reasoning_effort = kwargs.pop("reasoning_effort", self.reasoning_effort)
+        thinking_mode = kwargs.pop("thinking_mode", self.thinking_mode)
         return create_chat(
             model, [{"role": "user", "content": prompt}],
             token=token, chat_type=chat_type,
-            proxy=proxy, timeout=timeout, **kwargs,
+            proxy=proxy, timeout=timeout,
+            reasoning_effort=reasoning_effort, thinking_mode=thinking_mode, **kwargs,
         )
 
     async def generate_image(self, prompt: str, aspect_ratio: str = "1:1", **kwargs) -> list[str]:
@@ -122,6 +133,11 @@ class Generative:
         ):
             if event["type"] == "content":
                 urls.extend(_URL_RE.findall(event["data"]))
+        if not urls and not token:
+            raise QwenError(
+                "Video generation (t2v) is disabled for anonymous/guest access on "
+                "chat.qwen.ai. Pass a logged-in `token` to use it."
+            )
         return list(dict.fromkeys(urls))
 
     async def edit_image(
@@ -208,6 +224,8 @@ class Conversation:
         timeout: int = 300,
         tools: Optional[list] = None,
         max_tool_result_chars: int = 30_000,
+        reasoning_effort: Optional[str] = None,
+        thinking_mode: Optional[str] = None,
     ):
         self.model = model
         self.token = token
@@ -216,6 +234,8 @@ class Conversation:
         self.timeout = timeout
         self.tools = tools
         self.max_tool_result_chars = max_tool_result_chars
+        self.reasoning_effort = reasoning_effort
+        self.thinking_mode = thinking_mode
         self.messages: list[dict] = []
         self.conversation_id: Optional[str] = None
         self.parent_id: Optional[str] = None
@@ -240,11 +260,14 @@ class Conversation:
         timeout = kwargs.pop("timeout", self.timeout)
         tools = kwargs.pop("tools", self.tools)
         max_tool_result_chars = kwargs.pop("max_tool_result_chars", self.max_tool_result_chars)
+        reasoning_effort = kwargs.pop("reasoning_effort", self.reasoning_effort)
+        thinking_mode = kwargs.pop("thinking_mode", self.thinking_mode)
         files = await resolve_files(files, token=token, proxy=proxy) if files else None
         async for event in create_chat(
             model, self.messages, token=token, chat_type=chat_type,
             proxy=proxy, timeout=timeout, tools=tools, files=files,
             max_tool_result_chars=max_tool_result_chars,
+            reasoning_effort=reasoning_effort, thinking_mode=thinking_mode,
             conversation_id=self.conversation_id, parent_id=self.parent_id, **kwargs,
         ):
             yield event
@@ -261,6 +284,18 @@ class Conversation:
         self.conversation_id = None
         self.parent_id = None
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.reset()
+        return False
+
+
+async def alist(agen: AsyncIterator) -> list:
+    """Collect an async iterator/generator into a list."""
+    return [item async for item in agen]
+
 
 __all__ = [
     "__version__",
@@ -274,5 +309,7 @@ __all__ = [
     "text_models", "image_models", "vision_models", "models",
     "generate_cookies", "generate_fingerprint", "parse_fingerprint",
     "BXUAGenerator", "generate_bx_ua",
+    "TTS", "tts", "stream_audio", "fetch_tts_config",
     "Generative", "Conversation", "Image", "ImageEdit", "Video",
+    "alist",
 ]

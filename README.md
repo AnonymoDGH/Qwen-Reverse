@@ -52,6 +52,7 @@ In-depth stress testing on the live `chat.qwen.ai` backend reveals the following
 - **Image editing (i2i)** — `chat_type="image_edit"`: edit an uploaded image (add/remove/modify) and get back CDN URLs
 - **File upload** — `upload()` uploads local files (or URLs/bytes) into the web API for vision/editing chats
 - **Image / video generation** — t2i and t2v returning CDN URLs (`cdn.qwenlm.ai`)
+- **Text-to-speech (TTS)** — `TTS.synthesize()` mirrors the web "read aloud" button: returns raw PCM16 audio (or a full WAV with `wrap_wav=True`); `fetch_tts_config()` lists the available voices/languages. Works anonymously.
 - **No account required** — the web API works without a token; OAuth device-flow login (`chat.qwen.ai` account) is also implemented
 - **Anti-Bot & WAF Evasion** — built-in `BXUAGenerator` (cryptographic `bx-ua` header generation), browser fingerprinting, and session cookie handling (`ssxmod_itna`)
 - **Large tool-result upload** — when a tool returns a very long result it is uploaded as a text file and attached via `files` (keeping the chat payload small); only a preview is sent inline. Threshold is configurable with `max_tool_result_chars` (default 30 000; pass `None` to disable).
@@ -193,6 +194,49 @@ async def main():
 asyncio.run(main())
 ```
 
+### Text-to-Speech (Read Aloud)
+```python
+import asyncio
+from qwen_reverse import TTS
+
+async def main():
+    tts = TTS()
+    cfg = await tts.fetch_config()
+    print([s["speaker"] for s in cfg["audio_tts_speakers"]][:5])  # ['Cherry', 'Dylan', ...]
+
+    audio = await tts.synthesize("Hello, this is a voice test", wrap_wav=True)
+    with open("hello.wav", "wb") as fh:
+        fh.write(audio)
+
+asyncio.run(main())
+```
+
+### Streaming TTS (play while synthesizing)
+```python
+import asyncio
+from qwen_reverse import TTS
+
+async def main():
+    tts = TTS()
+    async for chunk in tts.stream("Real-time audio chunks"):
+        # feed `chunk` to your audio player as it arrives (raw PCM16)
+        play(chunk)
+
+asyncio.run(main())
+```
+
+### Async Context Manager & Helpers
+```python
+import asyncio
+from qwen_reverse import Conversation, alist
+
+async def main():
+    async with Conversation() as conv:          # auto-resets state on exit
+        events = await alist(conv.stream("Hello"))
+        # events is a list of all streamed dict events
+asyncio.run(main())
+```
+
 ---
 
 ## API Reference
@@ -202,6 +246,9 @@ asyncio.run(main())
 | `Generative(model=..., token=...)` | `.generate()`, `.stream()` (events: `reasoning`, `content`, `usage`, `tool_calls`, `done`) |
 | `Conversation(token=..., tools=..., proxy=...)` | `.send()`, `.stream()`, `.reset()` — persists `conversation_id` / `parent_id` across turns |
 | `Image(model=...)`, `Video(model=...)`, `ImageEdit(model=...)` | `.generate(prompt, aspect_ratio=...)` → list of CDN URLs; `ImageEdit.edit(prompt, image, aspect_ratio=...)` for image-to-image editing |
+| `TTS(model=...)` | `.synthesize(text, wrap_wav=False, sample_rate=24000)` → raw PCM16 or WAV bytes; `.stream(text)` → yields audio chunks as they arrive; `.fetch_config()` → available voices/languages |
+| `stream_audio(text, ...)` | low-level streaming TTS (base64 SSE chunks decoded to PCM16 bytes) |
+| `alist(agen)` | collect an async iterator/generator into a list |
 | `create_chat(model, messages, ...)` | low-level async generator; `conversation_id` / `parent_id` for multi-turn; `reasoning_effort` accepts `none` / `low` / `medium` / `high`; `max_tool_result_chars` uploads oversized tool results as files |
 | `fetch_models()` | fetch available models (`qwen3.8-max`, `qwen3.7-plus`, `qwen3-vl-plus`, ...) |
 | `upload(data, filename=...)` | upload a local path/bytes (or fetch+upload a URL) → file payload dict |
