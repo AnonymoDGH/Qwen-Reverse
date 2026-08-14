@@ -41,7 +41,7 @@ from .fingerprint import generate_fingerprint, parse_fingerprint
 from .bxua import BXUAGenerator, generate_bx_ua
 from .tts import TTS, tts, stream_audio, fetch_tts_config
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 _URL_RE = re.compile(r"https?://[^\s)\]]+")
 
