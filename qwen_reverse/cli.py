@@ -15,7 +15,6 @@ import os
 import shutil
 import socket
 import subprocess
-import sys
 import threading
 import time
 from .server.app import _parse_model_suffix
@@ -232,7 +231,7 @@ def launch_agent(base_url: str, agent_key: str, model_override: str | None = Non
     except FileNotFoundError:
         print(f"[{agent_key}] '{agent['cmd']}' not found. Install with:")
         print(f"  {agent['install']}")
-        print(f"\nOr set env vars manually:")
+        print("\nOr set env vars manually:")
         for k, v in agent["env"].items():
             print(f"  {k}={v.format(base_url=base_url)}")
     except KeyboardInterrupt:
@@ -252,7 +251,7 @@ def interactive_choose(available: list[str]) -> str | None:
         agent = AGENTS[key]
         print(f"  [{i}] {agent['name']:<16} ({agent['format']})")
 
-    print(f"  [0] Just start server (no agent)")
+    print("  [0] Just start server (no agent)")
 
     try:
         choice = input("\nChoose an agent to launch: ").strip()
@@ -325,8 +324,8 @@ def main():
     if args.openai:
         print("OpenAI setup:")
         print(f"  OPENAI_BASE_URL={base_url}")
-        print(f"  OPENAI_API_KEY=qwen-reverse")
-        print(f"  OPENAI_MODEL=qwen3.8-max")
+        print("  OPENAI_API_KEY=qwen-reverse")
+        print("  OPENAI_MODEL=qwen3.8-max")
         print()
 
     # If no agent requested via flag, detect and ask
@@ -353,7 +352,7 @@ def main():
             print(f"[server] Ready at {base_url}\n")
             launch_agent(base_url, requested_agent, model_override=args.model)
         else:
-            print(f"[server] Failed to start within 10s, check logs above.")
+            print("[server] Failed to start within 10s, check logs above.")
         return
 
     # Default: just run the server

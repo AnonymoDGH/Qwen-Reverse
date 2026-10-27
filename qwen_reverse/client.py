@@ -14,14 +14,38 @@ import aiohttp
 
 from .cookies import generate_cookies
 from .bxua import generate_bx_ua
-from .models import MODELS_REQUIRE_THINKING, REASONING_EFFORT_LEVELS
+from .models import REASONING_EFFORT_LEVELS
 
 QWEN_URL = "https://chat.qwen.ai"
 
+#: SPA build currently served by chat.qwen.ai.  A stale value here is one of
+#: the documented causes of silent 0-byte SSE responses.
+FE_VERSION = "0.3.26"
+BX_VERSION = "2.5.37"
+
+_TZ_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+_TZ_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+              'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+
+def _timezone_header() -> str:
+    """Mirror the web client's ``timezone`` header, e.g. ``Tue Oct 27 2026 15:11:03 GMT-0500``."""
+    now = datetime.datetime.now().astimezone()
+    offset = now.utcoffset() or datetime.timedelta(0)
+    total = int(offset.total_seconds())
+    sign = '+' if total >= 0 else '-'
+    total = abs(total)
+    return (
+        f"{_TZ_DAYS[now.weekday()]} {_TZ_MONTHS[now.month - 1]} "
+        f"{now.day:02d} {now.year} {now:%H:%M:%S} "
+        f"GMT{sign}{total // 3600:02d}{(total % 3600) // 60:02d}"
+    )
+
+
 DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
     'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Language': 'en-US,en;q=0.9',
     'Origin': QWEN_URL,
     'Referer': f'{QWEN_URL}/',
     'Content-Type': 'application/json',
@@ -31,8 +55,11 @@ DEFAULT_HEADERS = {
     'Connection': 'keep-alive',
     'X-Requested-With': 'XMLHttpRequest',
     'source': 'web',
-    'version': '0.2.84',
+    'version': FE_VERSION,
     'X-Accel-Buffering': 'no',
+    'sec-ch-ua': '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
 }
 
 class QwenError(Exception):
@@ -53,7 +80,12 @@ _midtoken_lock: asyncio.Lock = asyncio.Lock()
 def _get_headers(token: Optional[str] = None):
     data = generate_cookies()
     headers = {**DEFAULT_HEADERS}
-    headers['Cookie'] = f'ssxmod_itna={data["ssxmod_itna"]};ssxmod_itna2={data["ssxmod_itna2"]}'
+    headers['Cookie'] = (
+        f'ssxmod_itna={data["ssxmod_itna"]};'
+        f'ssxmod_itna2={data["ssxmod_itna2"]};'
+        'qwen_age_verification=passed'
+    )
+    headers['timezone'] = _timezone_header()
     if token:
         headers['Authorization'] = f'Bearer {token}'
     return headers
@@ -84,7 +116,7 @@ async def _attach_extra_headers(headers: dict, proxy: Optional[str] = None):
         if _midtoken is not None:
             _midtoken_uses += 1
             headers['bx-umidtoken'] = _midtoken
-    headers['bx-v'] = '2.5.37'
+    headers['bx-v'] = BX_VERSION
     headers['x-request-id'] = str(uuid.uuid4())
     # Regenerated per request, matching the web client's anti-bot behaviour.
     headers['bx-ua'] = generate_bx_ua()
@@ -121,6 +153,103 @@ async def _sse_stream(response: aiohttp.ClientResponse) -> AsyncIterator[dict]:
             continue
         if line.startswith("data:"):
             buffer.append(line[5:].lstrip())
+
+# ── browser transport (baxia-signed requests) ────────────────────────
+_browser_transport = None
+_browser_lock: asyncio.Lock = asyncio.Lock()
+
+
+async def get_browser_transport():
+    """Lazily start the shared CDP browser transport."""
+    global _browser_transport
+    async with _browser_lock:
+        if _browser_transport is None:
+            from .browser import BrowserTransport
+            headless = os.getenv("QWEN_BROWSER_HEADLESS", "0").lower() in ("1", "true", "yes", "on")
+            transport = BrowserTransport(headless=headless)
+            await transport.start()
+            _browser_transport = transport
+    return _browser_transport
+
+
+async def close_browser() -> None:
+    global _browser_transport
+    async with _browser_lock:
+        if _browser_transport is not None:
+            await _browser_transport.close()
+            _browser_transport = None
+
+
+async def _sse_events_from_text(chunks: AsyncIterator[str]) -> AsyncIterator[dict]:
+    """Parse SSE from an async iterator of text chunks (browser transport)."""
+    buf = ""
+    async for chunk in chunks:
+        buf += chunk.replace("\r\n", "\n")
+        while "\n\n" in buf:
+            block, buf = buf.split("\n\n", 1)
+            data_parts = [ln[5:].lstrip() for ln in block.split("\n") if ln.startswith("data:")]
+            if not data_parts:
+                continue
+            data = "\n".join(data_parts)
+            if data.strip() == "[DONE]":
+                return
+            try:
+                yield json.loads(data)
+            except json.JSONDecodeError:
+                continue
+    if buf.strip():
+        data_parts = [ln[5:].lstrip() for ln in buf.split("\n") if ln.startswith("data:")]
+        if data_parts:
+            try:
+                yield json.loads("\n".join(data_parts))
+            except json.JSONDecodeError:
+                pass
+
+
+def _events_from_chunk(chunk: dict):
+    """Map one upstream chunk to (events, usage, response_id).
+
+    Upstream emits two shapes:
+      * legacy: ``delta.reasoning`` / ``delta.content`` per token
+      * current: ``delta.phase`` = ``thinking_summary`` / ``answer`` with
+        ``extra.summary_title`` / ``extra.summary_thought``
+    """
+    events: list[tuple[str, Any]] = []
+    usage = chunk.get("usage") or {}
+    created = chunk.get("response.created")
+    response_id = chunk.get("response_id")
+    if isinstance(created, dict):
+        response_id = response_id or created.get("response_id")
+
+    choices = chunk.get("choices") or []
+    if choices:
+        delta = (choices[0] or {}).get("delta") or {}
+        phase = delta.get("phase")
+        content = delta.get("content")
+        extra = delta.get("extra") or {}
+
+        if phase == "image_gen" and delta.get("status") == "typing":
+            if content:
+                events.append(("image", {"url": content, "extra": extra}))
+        elif phase == "image_gen" and delta.get("status") == "finished":
+            events.append(("image_done", None))
+        elif phase == "thinking_summary":
+            thought = ""
+            block = extra.get("summary_thought") or {}
+            for item in block.get("content") or []:
+                thought += str(item)
+            if not thought:
+                title = extra.get("summary_title") or {}
+                thought = "".join(str(x) for x in (title.get("content") or []))
+            if thought:
+                events.append(("reasoning", thought))
+        elif delta.get("reasoning"):
+            events.append(("reasoning", delta["reasoning"]))
+        elif content and phase in (None, "answer"):
+            events.append(("content", content))
+        elif content and phase == "think":
+            events.append(("reasoning", content))
+    return events, usage, response_id
 
 def _extract_text(content) -> str:
     if isinstance(content, str):
@@ -521,7 +650,7 @@ async def execute_tool_call(tc: dict, tools: list[dict], session: aiohttp.Client
                         return await r.text()
                 except Exception as e:
                     return json.dumps({"error": str(e)})
-            return json.dumps({"result": f"Tool '{name}' executed", "arguments": args})
+            return json.dumps({"error": f"tool '{name}' has no executor url; wire it in your harness"})
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 def get_oss_headers(method: str, date_str: str, sts_data: dict, content_type: str) -> dict[str, str]:
@@ -739,6 +868,102 @@ async def resolve_files(
             out.append(await _upload_bytes(data, name, headers, session, proxy=proxy))
     return out
 
+def _build_chat_payload(model: str, chat_type: str, chat_mode: str, now: int) -> dict:
+    return {
+        "chatId": "",
+        "models": [model],
+        "project_id": "",
+        "timestamp": now,
+        "chat_type": chat_type,
+        "chat_mode": chat_mode,
+    }
+
+
+def _build_message_payload(
+    *,
+    model: str,
+    conversation_id: str,
+    parent_id: Optional[str],
+    prompt: str,
+    chat_type: str,
+    chat_mode: str,
+    feature_config: dict,
+    message_id: str,
+    timestamp_ms: int,
+    files: Optional[list],
+    aspect_ratio: Optional[str],
+) -> dict:
+    parent = parent_id or None
+    payload = {
+        "stream": True,
+        "version": "2.1",
+        "incremental_output": True,
+        "chatId": conversation_id,
+        "parentId": parent or "",
+        "chat_id": conversation_id,
+        "chat_mode": chat_mode,
+        "model": model,
+        "parent_id": parent,
+        "messages": [
+            {
+                "id": None,
+                "fid": message_id,
+                "parentId": parent,
+                "childrenIds": [str(uuid.uuid4())],
+                "role": "user",
+                "content": prompt,
+                "user_action": "chat",
+                "files": files or [],
+                "timestamp": int(timestamp_ms / 1000),
+                "models": [model],
+                "model": "",
+                "chat_type": chat_type,
+                "feature_config": feature_config,
+                "extra": {"meta": {"subChatType": chat_type}},
+                "sub_chat_type": chat_type,
+                "parent_id": parent,
+            }
+        ],
+        "timestamp": int(timestamp_ms / 1000),
+    }
+    if aspect_ratio:
+        payload["size"] = aspect_ratio
+    return payload
+
+
+async def _consume_sse(chunks, state: dict, seen_reasoning: set) -> AsyncIterator[dict]:
+    """Turn upstream SSE chunks into SDK events (shared by both transports)."""
+    accumulated = ""
+    usage: dict = {}
+    response_id: Optional[str] = None
+    async for chunk in chunks:
+        error = chunk.get("error", {})
+        if error:
+            raise QwenError(f'{error.get("code")}: {error.get("details", error)}')
+        events, chunk_usage, chunk_response_id = _events_from_chunk(chunk)
+        if chunk_usage:
+            usage = chunk_usage
+        if chunk_response_id:
+            response_id = chunk_response_id
+        for kind, data in events:
+            if kind == "reasoning":
+                if data in seen_reasoning:
+                    continue
+                seen_reasoning.add(data)
+                yield {"type": "reasoning", "data": data}
+            elif kind == "content":
+                accumulated += data
+                yield {"type": "content", "data": data}
+            elif kind == "image":
+                yield {"type": "image", "data": data}
+            elif kind == "image_done":
+                yield {"type": "image_done"}
+    state["content"] = accumulated
+    state["usage"] = usage
+    if response_id:
+        state["parent_id_out"] = response_id
+
+
 async def _send_message(
     model: str,
     conversation_id: str | None,
@@ -753,24 +978,40 @@ async def _send_message(
     files: list | None = None,
     aspect_ratio: str | None = None,
     _state: dict | None = None,
+    browser: bool = False,
 ) -> AsyncIterator[dict]:
     message_id = str(uuid.uuid4())
     now = int(time.time() * 1000)
     chat_mode = "guest" if not token else "normal"
+    state = _state if _state is not None else {}
+
+    if browser:
+        transport = await get_browser_transport()
+        if not conversation_id:
+            conversation_id = await transport.create_chat(model, chat_type, chat_mode)
+        msg_payload = _build_message_payload(
+            model=model, conversation_id=conversation_id, parent_id=parent_id,
+            prompt=prompt, chat_type=chat_type, chat_mode=chat_mode,
+            feature_config=feature_config, message_id=message_id,
+            timestamp_ms=now, files=files, aspect_ratio=aspect_ratio,
+        )
+        async for event in _consume_sse(
+            _sse_events_from_text(transport.stream_completion(conversation_id, msg_payload)),
+            state, set(),
+        ):
+            yield event
+        state["conv_id"] = conversation_id
+        state.setdefault("parent_id_out", message_id)
+        yield {"type": "usage", "data": state.get("usage", {})}
+        yield {"type": "done"}
+        return
 
     headers = _get_headers(token)
     await _attach_extra_headers(headers, proxy)
 
     async with aiohttp.ClientSession(headers=headers) as session:
         if not conversation_id:
-            chat_payload = {
-                "title": "New Chat",
-                "models": [model],
-                "chat_mode": chat_mode,
-                "chat_type": chat_type,
-                "timestamp": now,
-                "project_id": "",
-            }
+            chat_payload = _build_chat_payload(model, chat_type, chat_mode, now)
             async with session.post(f'{QWEN_URL}/api/v2/chats/new', json=chat_payload, proxy=proxy,
                                     timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
@@ -790,35 +1031,12 @@ async def _send_message(
         # The upstream API rejects stream=false with Bad_Request (verified
         # live), so the payload always requests SSE.  The `stream` flag only
         # affects how callers consume the yielded events.
-        msg_payload = {
-            "stream": True,
-            "version": "2.1",
-            "incremental_output": True,
-            "chat_id": conversation_id,
-            "chat_mode": chat_mode,
-            "model": model,
-            "parent_id": parent_id,
-            "messages": [
-                {
-                    "fid": message_id,
-                    "parentId": parent_id,
-                    "childrenIds": [],
-                    "role": "user",
-                    "content": prompt,
-                    "user_action": "chat",
-                    "files": files or [],
-                    "timestamp": now,
-                    "models": [model],
-                    "chat_type": chat_type,
-                    "feature_config": feature_config,
-                    "extra": {"meta": {"subChatType": chat_type}},
-                    "sub_chat_type": chat_type,
-                }
-            ],
-            "timestamp": now,
-        }
-        if aspect_ratio:
-            msg_payload["size"] = aspect_ratio
+        msg_payload = _build_message_payload(
+            model=model, conversation_id=conversation_id, parent_id=parent_id,
+            prompt=prompt, chat_type=chat_type, chat_mode=chat_mode,
+            feature_config=feature_config, message_id=message_id,
+            timestamp_ms=now, files=files, aspect_ratio=aspect_ratio,
+        )
 
         async with session.post(
             f'{QWEN_URL}/api/v2/chat/completions?chat_id={conversation_id}',
@@ -827,52 +1045,32 @@ async def _send_message(
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as resp:
             await _raise_for_status(resp)
-            accumulated = ""
-            usage: dict = {}
-            response_id = None
-            async for chunk in _sse_stream(resp):
-                error = chunk.get("error", {})
-                if error:
-                    raise QwenError(f'{error.get("code")}: {error.get("details", error)}')
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
-                if chunk.get("response_id"):
-                    response_id = chunk["response_id"]
-                delta = (chunk.get("choices") or [{}])[0].get("delta", {})
-                phase = delta.get("phase")
-                content = delta.get("content")
-                reasoning = delta.get("reasoning")
-                status = delta.get("status")
-                extra = delta.get("extra", {})
-                if phase == "image_gen" and status == "typing":
-                    yield {"type": "image", "data": {"url": content, "extra": extra}}
-                    continue
-                elif phase == "image_gen" and status == "finished":
-                    yield {"type": "image_done"}
-                    continue
-                if reasoning:
-                    yield {"type": "reasoning", "data": reasoning}
-                elif content and phase == "answer":
-                    accumulated += content
-                    yield {"type": "content", "data": content}
-                elif content and phase == "think":
-                    yield {"type": "reasoning", "data": content}
-            if _state is not None:
-                _state["conv_id"] = conversation_id
-                _state["parent_id_out"] = response_id or message_id
-                _state["content"] = accumulated
-                _state["usage"] = usage
-            yield {"type": "usage", "data": usage}
+            async for event in _consume_sse(_sse_stream(resp), state, set()):
+                yield event
+            state["conv_id"] = conversation_id
+            state.setdefault("parent_id_out", message_id)
+            yield {"type": "usage", "data": state.get("usage", {})}
             yield {"type": "done"}
 
-async def fetch_models(token: Optional[str] = None, proxy: Optional[str] = None) -> list[str]:
+async def fetch_models(token: Optional[str] = None, proxy: Optional[str] = None,
+                       browser: bool = False) -> list[str]:
+    if browser:
+        transport = await get_browser_transport()
+        data = await transport.fetch_json("/api/v2/models/", None, method="GET")
+        items = (data.get("data") or {})
+        if isinstance(items, dict):
+            items = items.get("data") or []
+        return [m["id"] for m in items if isinstance(m, dict) and "id" in m]
     headers = _get_headers(token)
     await _attach_extra_headers(headers, proxy)
     async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.get(f'{QWEN_URL}/api/models', proxy=proxy) as resp:
+        async with session.get(f'{QWEN_URL}/api/v2/models/', proxy=proxy) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m]
+            items = (data.get("data") or {}).get("data") or data.get("data") or []
+            if isinstance(items, dict):
+                items = items.get("data") or []
+            return [m["id"] for m in items if isinstance(m, dict) and "id" in m]
 
 def _build_feature_config(
     model: str,
@@ -881,44 +1079,38 @@ def _build_feature_config(
 ) -> dict:
     """Build the ``feature_config`` payload sent to chat.qwen.ai.
 
-    ``reasoning_effort`` must be one of ``REASONING_EFFORT_LEVELS``
-    (``none``, ``low``, ``medium``, ``high``).  An explicit ``"none"``
-    disables thinking for *all* models, including those in
-    ``MODELS_REQUIRE_THINKING``: the upstream API accepts
-    ``thinking_enabled: false`` everywhere (verified live).
+    Live shape (captured from the 0.3.26 SPA) does **not** include
+    ``thinking_budget``; the server derives it from ``thinking_mode``.
 
-    For ``low``/``medium``/``high`` the SDK differentiates the
-    ``thinking_mode`` and ``thinking_budget`` so the API can tune
-    reasoning depth per level.
+    ``None`` means "web default" (Auto thinking).  Explicit ``"none"``
+    disables thinking for every model; ``low``/``medium``/``high`` select
+    Fast/Auto modes.
     """
-    if reasoning_effort is not None and reasoning_effort.lower() not in REASONING_EFFORT_LEVELS:
+    if reasoning_effort is None:
+        reasoning_effort = "medium"
+    if reasoning_effort.lower() not in REASONING_EFFORT_LEVELS:
         raise QwenError(
             f"Invalid reasoning_effort '{reasoning_effort}'. "
             f"Must be one of: {', '.join(REASONING_EFFORT_LEVELS)}"
         )
 
-    if not reasoning_effort or reasoning_effort.lower() == "none":
+    if reasoning_effort.lower() == "none":
         return {
             "thinking_enabled": False,
             "output_schema": "phase",
             "thinking_format": "summary",
-            "thinking_budget": 81920,
         }
 
     effort = reasoning_effort.lower()
     _thinking_mode = thinking_mode or ("Fast" if effort == "low" else "Auto")
-    auto_thinking = _thinking_mode == "Auto"
-    thinking_budget = {"low": 40960, "medium": 81920, "high": 163840}[effort]
-
     return {
-        "auto_thinking": auto_thinking,
-        "thinking_mode": _thinking_mode,
         "thinking_enabled": True,
         "output_schema": "phase",
-        "thinking_format": "summary",
         "research_mode": "normal",
+        "auto_thinking": _thinking_mode == "Auto",
+        "thinking_mode": _thinking_mode,
+        "thinking_format": "summary",
         "auto_search": True,
-        "thinking_budget": thinking_budget,
     }
 
 async def create_chat(
@@ -938,6 +1130,7 @@ async def create_chat(
     files: Optional[list[dict]] = None,
     aspect_ratio: Optional[Literal["1:1", "4:3", "3:4", "16:9", "9:16"]] = None,
     max_tool_result_chars: int = 30_000,
+    browser: bool = False,
     **kwargs: Any,
 ) -> AsyncIterator[dict]:
     feature_config = _build_feature_config(model, reasoning_effort, thinking_mode)
@@ -978,6 +1171,7 @@ async def create_chat(
             async for event in _send_message(
                 model, conversation_id, parent_id, prompt, chat_type, feature_config,
                 proxy, timeout, stream, token, files, aspect_ratio, _state=state,
+                browser=browser,
             ):
                 if event["type"] == "content":
                     _content_buffer.append(event["data"])
@@ -1002,6 +1196,7 @@ async def create_chat(
                                 tool_calls, tools, model, conv_id, parent_id_out,
                                 chat_type, feature_config, proxy, timeout, stream, token,
                                 max_tool_result_chars=max_tool_result_chars,
+                                browser=browser,
                             ):
                                 yield evt
                             return
@@ -1034,6 +1229,7 @@ async def _run_tool_calls(
     stream: bool,
     token: str | None,
     max_tool_result_chars: int = 30_000,
+    browser: bool = False,
 ) -> AsyncIterator[dict]:
     async with aiohttp.ClientSession() as tool_session:
         for tc in tool_calls:
@@ -1045,6 +1241,7 @@ async def _run_tool_calls(
                 name, tool_result, max_tool_result_chars, token=token, proxy=proxy,
             )
             
+            succeeded = False
             for retry in range(3):
                 try:
                     state2: dict = {}
@@ -1052,7 +1249,7 @@ async def _run_tool_calls(
                         model, conv_id, parent_id_out,
                         prompt,
                         chat_type, feature_config, proxy, timeout, stream, token,
-                        files=files, _state=state2,
+                        files=files, _state=state2, browser=browser,
                     ):
                         if evt["type"] == "done":
                             break
@@ -1062,6 +1259,7 @@ async def _run_tool_calls(
                         "conversation_id": state2.get("conv_id") or conv_id or "",
                         "parent_id": state2.get("parent_id_out") or parent_id_out or "",
                     }
+                    succeeded = True
                     break
                 except (aiohttp.ClientResponseError, QwenRateLimitError) as e:
                     if e.status == 429 or "429" in str(e) or "RateLimited" in str(e):
@@ -1072,6 +1270,8 @@ async def _run_tool_calls(
                     raise
                 except Exception as e:
                     raise QwenError(f"Follow-up failed: {e}")
+            if not succeeded:
+                raise QwenRateLimitError("Tool follow-up rate limited after 3 attempts")
     return
 
 

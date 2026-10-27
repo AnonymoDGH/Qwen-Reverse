@@ -18,6 +18,8 @@ from .client import (
     parse_tool_response,
     execute_tool_call,
     get_oss_headers,
+    get_browser_transport,
+    close_browser,
 )
 from .auth import (
     QwenOAuthError,
@@ -39,9 +41,10 @@ from .models import (
 from .cookies import generate_cookies
 from .fingerprint import generate_fingerprint, parse_fingerprint
 from .bxua import BXUAGenerator, generate_bx_ua
+from .baxia import QwenCaptchaError
 from .tts import TTS, tts, stream_audio, fetch_tts_config
 
-__version__ = "0.1.6"
+__version__ = "0.2.0"
 
 _URL_RE = re.compile(r"https?://[^\s)\]]+")
 
@@ -56,6 +59,7 @@ class Generative:
         timeout: int = 300,
         reasoning_effort: Optional[str] = None,
         thinking_mode: Optional[str] = None,
+        browser: bool = False,
     ):
         self.model = model
         self.token = token
@@ -64,6 +68,7 @@ class Generative:
         self.timeout = timeout
         self.reasoning_effort = reasoning_effort
         self.thinking_mode = thinking_mode
+        self.browser = browser
 
     async def generate(self, prompt: str, **kwargs) -> str:
         parts = []
@@ -74,11 +79,13 @@ class Generative:
         chat_type = kwargs.pop("chat_type", self.chat_type)
         reasoning_effort = kwargs.pop("reasoning_effort", self.reasoning_effort)
         thinking_mode = kwargs.pop("thinking_mode", self.thinking_mode)
+        browser = kwargs.pop("browser", self.browser)
         async for event in create_chat(
             model, [{"role": "user", "content": prompt}],
             token=token, chat_type=chat_type,
             proxy=proxy, timeout=timeout,
-            reasoning_effort=reasoning_effort, thinking_mode=thinking_mode, **kwargs,
+            reasoning_effort=reasoning_effort, thinking_mode=thinking_mode,
+            browser=browser, **kwargs,
         ):
             if event["type"] == "content":
                 parts.append(event["data"])
@@ -92,11 +99,13 @@ class Generative:
         chat_type = kwargs.pop("chat_type", self.chat_type)
         reasoning_effort = kwargs.pop("reasoning_effort", self.reasoning_effort)
         thinking_mode = kwargs.pop("thinking_mode", self.thinking_mode)
+        browser = kwargs.pop("browser", self.browser)
         return create_chat(
             model, [{"role": "user", "content": prompt}],
             token=token, chat_type=chat_type,
             proxy=proxy, timeout=timeout,
-            reasoning_effort=reasoning_effort, thinking_mode=thinking_mode, **kwargs,
+            reasoning_effort=reasoning_effort, thinking_mode=thinking_mode,
+            browser=browser, **kwargs,
         )
 
     async def generate_image(self, prompt: str, aspect_ratio: str = "1:1", **kwargs) -> list[str]:
@@ -106,11 +115,12 @@ class Generative:
         proxy = kwargs.pop("proxy", self.proxy)
         timeout = kwargs.pop("timeout", self.timeout)
         aspect_ratio = kwargs.pop("aspect_ratio", aspect_ratio)
+        browser = kwargs.pop("browser", self.browser)
         async for event in create_chat(
             model, [{"role": "user", "content": prompt}],
             token=token, chat_type="t2i",
             proxy=proxy, timeout=timeout,
-            aspect_ratio=aspect_ratio, **kwargs,
+            aspect_ratio=aspect_ratio, browser=browser, **kwargs,
         ):
             if event["type"] == "image":
                 urls.append(event["data"]["url"])
@@ -125,11 +135,12 @@ class Generative:
         proxy = kwargs.pop("proxy", self.proxy)
         timeout = kwargs.pop("timeout", self.timeout)
         aspect_ratio = kwargs.pop("aspect_ratio", aspect_ratio)
+        browser = kwargs.pop("browser", self.browser)
         async for event in create_chat(
             model, [{"role": "user", "content": prompt}],
             token=token, chat_type="t2v",
             proxy=proxy, timeout=timeout,
-            aspect_ratio=aspect_ratio, **kwargs,
+            aspect_ratio=aspect_ratio, browser=browser, **kwargs,
         ):
             if event["type"] == "content":
                 urls.extend(_URL_RE.findall(event["data"]))
@@ -158,12 +169,13 @@ class Generative:
         proxy = kwargs.pop("proxy", self.proxy)
         timeout = kwargs.pop("timeout", self.timeout)
         aspect_ratio = kwargs.pop("aspect_ratio", aspect_ratio)
+        browser = kwargs.pop("browser", self.browser)
         files = await resolve_files([image], token=token, proxy=proxy)
         async for event in create_chat(
             model, [{"role": "user", "content": prompt}],
             token=token, chat_type="image_edit",
             proxy=proxy, timeout=timeout,
-            files=files, aspect_ratio=aspect_ratio, **kwargs,
+            files=files, aspect_ratio=aspect_ratio, browser=browser, **kwargs,
         ):
             if event["type"] == "image":
                 urls.append(event["data"]["url"])
@@ -226,6 +238,7 @@ class Conversation:
         max_tool_result_chars: int = 30_000,
         reasoning_effort: Optional[str] = None,
         thinking_mode: Optional[str] = None,
+        browser: bool = False,
     ):
         self.model = model
         self.token = token
@@ -236,6 +249,7 @@ class Conversation:
         self.max_tool_result_chars = max_tool_result_chars
         self.reasoning_effort = reasoning_effort
         self.thinking_mode = thinking_mode
+        self.browser = browser
         self.messages: list[dict] = []
         self.conversation_id: Optional[str] = None
         self.parent_id: Optional[str] = None
@@ -262,13 +276,15 @@ class Conversation:
         max_tool_result_chars = kwargs.pop("max_tool_result_chars", self.max_tool_result_chars)
         reasoning_effort = kwargs.pop("reasoning_effort", self.reasoning_effort)
         thinking_mode = kwargs.pop("thinking_mode", self.thinking_mode)
+        browser = kwargs.pop("browser", self.browser)
         files = await resolve_files(files, token=token, proxy=proxy) if files else None
         async for event in create_chat(
             model, self.messages, token=token, chat_type=chat_type,
             proxy=proxy, timeout=timeout, tools=tools, files=files,
             max_tool_result_chars=max_tool_result_chars,
             reasoning_effort=reasoning_effort, thinking_mode=thinking_mode,
-            conversation_id=self.conversation_id, parent_id=self.parent_id, **kwargs,
+            conversation_id=self.conversation_id, parent_id=self.parent_id,
+            browser=browser, **kwargs,
         ):
             yield event
             if event["type"] == "content":
@@ -300,10 +316,10 @@ async def alist(agen: AsyncIterator) -> list:
 __all__ = [
     "__version__",
     "QWEN_URL", "DEFAULT_HEADERS",
-    "QwenError", "QwenAuthError", "QwenRateLimitError", "QwenOAuthError",
+    "QwenError", "QwenAuthError", "QwenRateLimitError", "QwenOAuthError", "QwenCaptchaError",
     "create_chat", "fetch_models", "upload_file", "upload", "resolve_files",
     "build_tool_system_prompt", "inject_tools", "parse_tool_response", "execute_tool_call",
-    "get_oss_headers",
+    "get_oss_headers", "get_browser_transport", "close_browser",
     "QwenOAuth2Client", "SharedTokenManager", "start_device_login", "complete_device_login",
     "DEFAULT_MODEL", "MODELS_REQUIRE_THINKING", "CHAT_TYPES", "ASPECT_RATIOS",
     "text_models", "image_models", "vision_models", "models",

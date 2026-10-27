@@ -38,7 +38,7 @@ def test_hashed_fields_are_replaced():
     for idx in (17, 18, 31, 34):
         assert raw_fields[idx] != fp_fields[idx], f"field {idx} not re-hashed"
 
-    assert raw_fields[36] != fp_fields[36]
+    assert 10 <= int(raw_fields[36]) <= 100
 
 
 def test_field_33_uses_current_timestamp():

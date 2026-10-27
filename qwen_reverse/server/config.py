@@ -11,11 +11,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 @dataclass
 class Settings:
-    host: str = field(default_factory=lambda: os.getenv("QWEN_HOST", "0.0.0.0"))
+    host: str = field(default_factory=lambda: os.getenv("QWEN_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(os.getenv("QWEN_PORT", "8090")))
     qwen_token: str | None = field(default_factory=lambda: os.getenv("QWEN_TOKEN") or None)
     debug: bool = field(default_factory=lambda: _env_bool("QWEN_DEBUG"))
     public_url: str | None = field(default_factory=lambda: os.getenv("QWEN_PUBLIC_URL") or None)
+    #: Use the real-browser (CDP) transport. Required for the 2026 baxia WAF.
+    browser: bool = field(default_factory=lambda: _env_bool("QWEN_BROWSER", True))
 
 
 settings = Settings()

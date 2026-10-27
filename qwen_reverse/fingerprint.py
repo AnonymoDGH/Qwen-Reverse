@@ -1,6 +1,6 @@
 import random
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 DEFAULT_TEMPLATE: Dict[str, Any] = {
     "deviceId": "84985177a19a010dea49",

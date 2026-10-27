@@ -2,7 +2,7 @@ import qwen_reverse
 
 
 def test_version():
-    assert qwen_reverse.__version__ == "0.1.6"
+    assert qwen_reverse.__version__ == "0.2.0"
 
 
 def test_public_exports_exist():

@@ -1,9 +1,4 @@
-
-import sys
-sys.path.insert(0, r"C:\Users\USUARIO\Qwen-Reverse")
-sys.path.insert(0, r"C:\Users\USUARIO\Qwen-Reverse\server")
-
-from server.app import _parse_model_suffix, _format_search_info
+from qwen_reverse.server.app import _parse_model_suffix, _format_search_info
 
 def test_special_suffixes():
     assert _parse_model_suffix("qwen3.8-max-web-dev") == ("qwen3.8-max", "web_dev", None)

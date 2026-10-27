@@ -134,9 +134,9 @@ def _map_size_to_aspect_ratio(size: str | None) -> str:
     s = size.lower().strip()
     if s in ("1:1", "4:3", "3:4", "16:9", "9:16"):
         return s
-    if "1024x1792" in s or "720" in s or "9:16" in s:
+    if "1024x1792" in s or "9:16" in s:
         return "9:16"
-    if "1792x1024" in s or "1280" in s or "1920" in s or "16:9" in s:
+    if "1792x1024" in s or "1280x720" in s or "1920" in s or "16:9" in s:
         return "16:9"
     if "1024x768" in s or "4:3" in s:
         return "4:3"
@@ -219,7 +219,7 @@ app = FastAPI(
 @app.get("/v1/models", response_model=ModelsResponse)
 async def list_models():
     try:
-        models = await fetch_models(settings.qwen_token)
+        models = await fetch_models(settings.qwen_token, browser=settings.browser)
         all_models = []
         for m in models:
             all_models.append(m)
@@ -272,6 +272,7 @@ async def chat_completion(body: ChatRequest):
             emit_tool_calls=True,
             files=body.files,
             aspect_ratio=body.aspect_ratio,
+            browser=settings.browser,
         ):
             if event["type"] == "content":
                 content_buffer.append(event["data"])
@@ -341,6 +342,7 @@ async def _stream_chat(body: ChatRequest, token: str | None):
         emit_tool_calls=True,
         files=body.files,
         aspect_ratio=body.aspect_ratio,
+        browser=settings.browser,
     ):
         if event["type"] == "content":
             yield f'data: {json.dumps({"id": full_response_id, "object": "chat.completion.chunk", "created": created, "model": body.model, "choices": [{"index": 0, "delta": {"content": event["data"]}, "finish_reason": None}]})}\n\n'
@@ -362,7 +364,6 @@ async def _stream_chat(body: ChatRequest, token: str | None):
 
 @app.post("/v1/embeddings")
 async def embeddings(body: EmbeddingsRequest):
-    token = body.token or settings.qwen_token
     try:
         # qwen-reverse does not have a dedicated embeddings endpoint;
         # return a placeholder embedding so clients that call /v1/embeddings
@@ -395,7 +396,6 @@ async def completions(body: CompletionsRequest):
         base_model, _, _ = _parse_model_suffix(body.model)
         content_buffer = []
         reasoning_buffer = []
-        tool_calls = None
         usage = {}
         prompt = body.prompt if isinstance(body.prompt, str) else body.prompt[0]
         async for event in create_chat(
@@ -411,8 +411,6 @@ async def completions(body: CompletionsRequest):
                 content_buffer.append(event["data"])
             elif event["type"] == "reasoning":
                 reasoning_buffer.append(event["data"])
-            elif event["type"] == "tool_calls":
-                tool_calls = event["data"]
             elif event["type"] == "usage":
                 usage = event["data"]
             elif event["type"] == "done":
@@ -476,7 +474,7 @@ class AnthropicRequest(BaseModel):
 
 def _anthropic_to_openai(body: AnthropicRequest) -> dict:
     """Translate an Anthropic Messages request into OpenAI Chat Completions params."""
-    model = _map_model(body.model)
+    model, chat_type, reasoning_effort = _parse_model_suffix(body.model)
     messages: list[dict] = []
     if body.system:
         messages.append({"role": "system", "content": body.system})
@@ -496,9 +494,11 @@ def _anthropic_to_openai(body: AnthropicRequest) -> dict:
         "model": model,
         "messages": messages,
         "token": settings.qwen_token,
-        "chat_type": "t2t",
-        "reasoning_effort": "medium",
+        "chat_type": chat_type,
+        "reasoning_effort": reasoning_effort or "medium",
         "stream": body.stream,
+        "emit_tool_calls": True,
+        "browser": settings.browser,
     }
     if body.max_tokens:
         kwargs["max_tokens"] = body.max_tokens
@@ -521,10 +521,10 @@ async def _anthropic_stream(body: AnthropicRequest):
     """Translate OpenAI SSE stream into Anthropic Messages SSE format."""
     openai_kwargs = _anthropic_to_openai(body)
     response_id = f"msg_{uuid.uuid4()}"
-    content_block_index = 0
-    reasoning_block_index = 0
-    has_content = False
-    has_reasoning = False
+    next_index = 0
+    reasoning_block_index: int | None = None
+    content_block_index: int | None = None
+    has_tool = False
     total_input_tokens = 0
     total_output_tokens = 0
 
@@ -534,38 +534,50 @@ async def _anthropic_stream(body: AnthropicRequest):
     async for event in create_chat(**openai_kwargs):
         if event["type"] == "done":
             break
-        data = event["data"]
         if event["type"] == "content":
-            if not has_content:
+            if content_block_index is None:
+                content_block_index = next_index
+                next_index += 1
                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': content_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                has_content = True
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': content_block_index, 'delta': {'type': 'text_delta', 'text': data}})}\n\n"
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': content_block_index, 'delta': {'type': 'text_delta', 'text': event['data']}})}\n\n"
         elif event["type"] == "reasoning":
-            if not has_reasoning:
+            if reasoning_block_index is None:
+                reasoning_block_index = next_index
+                next_index += 1
                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': reasoning_block_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
-                has_reasoning = True
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': reasoning_block_index, 'delta': {'type': 'thinking_delta', 'thinking': data}})}\n\n"
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': reasoning_block_index, 'delta': {'type': 'thinking_delta', 'thinking': event['data']}})}\n\n"
         elif event["type"] == "tool_calls":
             for tc in event["data"]:
-                tc_index = content_block_index + (1 if has_content else 0) + (1 if has_reasoning else 0)
-                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': tc_index, 'content_block': {'type': 'tool_use', 'id': tc.get('id', uuid.uuid4().hex), 'name': tc.get('name', ''), 'input': tc.get('input', {})}})}\n\n"
-                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': tc_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(tc.get('input', {}))}})}\n\n"
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                name = fn.get("name") or tc.get("name", "")
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        input_obj = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        input_obj = {}
+                elif isinstance(raw_args, dict):
+                    input_obj = raw_args
+                else:
+                    input_obj = tc.get("input") or {}
+                tc_index = next_index
+                next_index += 1
+                has_tool = True
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': tc_index, 'content_block': {'type': 'tool_use', 'id': tc.get('id') or uuid.uuid4().hex, 'name': name, 'input': {}}})}\n\n"
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': tc_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(input_obj)}})}\n\n"
                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tc_index})}\n\n"
         elif event["type"] == "usage":
             usage = event["data"]
             total_input_tokens = usage.get("input_tokens", 0)
             total_output_tokens = usage.get("output_tokens", 0)
 
-    # Emit content_block_stop for text/reasoning blocks
-    if has_content:
+    if content_block_index is not None:
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n"
-    if has_reasoning:
+    if reasoning_block_index is not None:
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': reasoning_block_index})}\n\n"
 
-    # Emit message_delta with usage
-    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens}})}\n\n"
-
-    # Emit message_stop
+    stop_reason = "tool_use" if has_tool else "end_turn"
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens}})}\n\n"
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
     yield "data: [DONE]\n\n"
 

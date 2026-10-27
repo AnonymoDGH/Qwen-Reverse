@@ -60,6 +60,49 @@ In-depth stress testing on the live `chat.qwen.ai` backend reveals the following
 
 ---
 
+## Browser mode (required since the 2026 baxia WAF)
+
+`chat.qwen.ai/api/v2` is now gated by **baxiaCommon.js 2.5.37**: every request
+needs a per-request `bx-ua` signed with `performance.now()`, the full WAF cookie
+state (`acw_tc`, `cna`, `tfstk`, `isg`, `ssxmod_itna`, `x5sec`), and a valid SPA
+version (`0.3.26`). A pure aiohttp client gets the Aliyun JS challenge or
+`RGV587_ERROR::SM` (puzzle captcha).
+
+`browser=True` runs the request inside a real Chrome page (via CDP), where
+baxia signs it, and solves the captcha automatically (puzzle + slide-to-end):
+
+```python
+import asyncio
+from qwen_reverse import Generative, close_browser
+
+async def main():
+    gen = Generative(model="qwen3.7-plus", browser=True)
+    print(await gen.generate("Say only OK"))
+    await close_browser()
+
+asyncio.run(main())
+```
+
+- Chrome is auto-launched with CDP on port 9222 if none is running.
+- The profile is persistent: `~/.qwen/browser-profile` (override with
+  `ChromeCDP(user_data_dir=...)` or `QWEN_BROWSER_PROFILE`). Keep it warm; do
+  **not** clear its cookies.
+- First run on a cold profile: Aliyun returns `F015` (interaction failed) and,
+  after two quick failures, `F011` (same-device rate limit) — after that even a
+  perfect manual solve is rejected for a few minutes. Warm the profile once:
+
+  ```bash
+  qwen-reverse-warmup      # or: python -m qwen_reverse.warmup
+  ```
+
+  Log in (or solve the captcha manually) in the window it opens, send one
+  message, close Chrome. The resulting `x5sec` / `acw_*` cookies persist and
+  automated runs work.
+- The solver attempts each widget exactly once to avoid tripping `F011`.
+- The server enables browser mode by default (`QWEN_BROWSER=1`).
+
+---
+
 ## Quickstart
 
 ### Basic Text Generation

@@ -213,6 +213,7 @@ class SharedTokenManager:
 
     async def _perform_token_refresh(self, client: QwenOAuth2Client, force_refresh: bool) -> dict:
         lock_path = self._lock_file()
+        acquired = False
         try:
             if self.memory_cache["credentials"] is None:
                 self._reload_credentials()
@@ -220,6 +221,7 @@ class SharedTokenManager:
             if not client.get_credentials().get("refresh_token"):
                 raise QwenOAuthError("No refresh token")
             await self._acquire_lock(lock_path)
+            acquired = True
 
             self._check_reload()
             if (
@@ -246,7 +248,8 @@ class SharedTokenManager:
             await self._save_credentials(credentials)
             return credentials
         finally:
-            await self._release_lock(lock_path)
+            if acquired:
+                await self._release_lock(lock_path)
 
     async def _acquire_lock(self, lock_path: Path):
         lock_path.parent.mkdir(parents=True, exist_ok=True)
